@@ -1,305 +1,358 @@
 # -*- coding: utf-8 -*-
-"""
-gpro_ec2_train_py311.py
+# GPRO_3b_ec2.py
 
-Script to train Qwen2-0.5B with GRPO on an EC2 instance with multiple GPUs.
-This script is compatible with Python 3.11.x environments.
-Ensure all dependencies (transformers, peft, trl, datasets, torch, accelerate, math-verify)
-are installed in your Python 3.11 environment and are compatible with your CUDA version.
-"""
+# Installation instructions for EC2 (run these in your environment before executing the script):
+# pip install -U trl peft math_verify transformers datasets huggingface_hub accelerate torch
+# Ensure CUDA is available and compatible with your torch version if using GPU.
 
 import os
 import re
-import shutil
+import shutil # For managing directories if needed
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
-from math_verify import LatexExtractionConfig, parse, verify # Ensure 'math-verify' is installed
+from huggingface_hub import login
+from peft import LoraConfig, get_peft_model, PeftModel
+from math_verify import LatexExtractionConfig, parse, verify
 from trl import GRPOConfig, GRPOTrainer
 
-# Helper function to print only on the main process in DDP
-def print_on_main_process(message):
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print(message)
+# --- Configuration ---
+# Hugging Face Login (recommended: set HUGGING_FACE_HUB_TOKEN environment variable)
+try:
+    login_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if login_token:
+        login(token=login_token, add_to_git_credential=False) # add_to_git_credential=False for non-interactive
+        print("Hugging Face Hub login successful using HUGGING_FACE_HUB_TOKEN.")
+    else:
+        print("HUGGING_FACE_HUB_TOKEN not found. Attempting interactive login if needed by model download.")
+        # login() # Or just let operations that need it fail/prompt.
+except Exception as e:
+    print(f"Hugging Face Hub login attempt issue. Ensure you are logged in if private models are used. Error: {e}")
 
-def main():
-    # --- Configuration ---
-    dataset_id = "AI-MO/NuminaMath-TIR"
-    model_id = "Qwen/Qwen2-0.5B-Instruct"
+# Dataset and Model IDs
+dataset_id = "AI-MO/NuminaMath-TIR"
+model_id = "Qwen/Qwen2-0.5B-Instruct" # Base model for fine-tuning
+
+# Output directory for the trained model
+TRAINED_MODEL_DIR = "Qwen2-0.5B-GRPO-NuminaMath-Finetuned"
+
+# System prompt for the task
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+    "<think> reasoning process here </think><answer> answer here </answer>"
+)
+
+# --- Dataset Preparation ---
+print(f"Loading dataset: {dataset_id}")
+# Using a smaller portion for demonstration. Adjust or remove slicing for full training.
+# E.g., split=["train", "test"] for full dataset.
+# For EC2, manage data size based on instance capabilities and time.
+train_dataset_raw = load_dataset(dataset_id, split="train[:1%]") # Use a small slice for faster run
+# test_dataset_raw = load_dataset(dataset_id, split="test[:1%]") # Test set not directly used by GRPOTrainer.train, but good for eval
+
+print(f"Loaded raw train dataset: {train_dataset_raw}")
+
+def make_conversation_and_prepare_columns(example):
+    """Formats the problem into a chat prompt and ensures 'solution' is available."""
+    return {
+        "prompt": [ # This will be the main input for the GRPOTrainer
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": example["problem"]},
+        ],
+        "solution": example["solution"] # Keep solution for the accuracy reward function
+    }
+
+train_dataset = train_dataset_raw.map(make_conversation_and_prepare_columns)
+
+# Remove original columns that are now incorporated into 'prompt' or are not needed
+# 'problem' is in 'prompt', 'solution' is kept, 'messages' (original format) is not needed.
+train_dataset = train_dataset.remove_columns(["problem", "messages"])
+
+print(f"Processed train dataset: {train_dataset}")
+print(f"Train dataset features: {train_dataset.features}")
+if len(train_dataset) == 0:
+    raise ValueError("Train dataset is empty. Check data loading and slicing.")
+
+
+# --- Model Loading and PEFT Setup ---
+print(f"Loading base model: {model_id}")
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype="auto",  # Automatically selects precision (bfloat16, float16, or float32)
+    device_map="auto",   # Automatically distributes model across available devices (GPU/CPU)
+)
+
+# LoRA Configuration
+lora_config = LoraConfig(
+    task_type="CAUSAL_LM",
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=["q_proj", "v_proj"], # Modules to apply LoRA to. Check model architecture if changing.
+)
+
+model = get_peft_model(model, lora_config)
+print("Trainable parameters after PEFT setup:")
+model.print_trainable_parameters()
+
+# --- Reward Functions ---
+def format_reward(completions, **kwargs):
+    """Reward function that checks if the completion has the specified <think>...</think><answer>...</answer> format."""
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    # Completions is a list of lists of dicts: [[{"role": "assistant", "content": "..."}], ...]
+    # We need the content string.
+    completion_contents = [comp[0]["content"] for comp in completions if comp and comp[0] and "content" in comp[0]]
+    rewards_list = [1.0 if re.match(pattern, content, re.DOTALL) else 0.0 for content in completion_contents]
+    return rewards_list
+
+def accuracy_reward(completions, **kwargs):
+    """Reward function that checks if the answer in the completion matches the ground truth solution."""
+    # 'solution' column from the dataset is passed via kwargs by GRPOTrainer if remove_unused_columns=False
+    solutions = kwargs["solution"] # This will be a list of solutions, one for each prompt in the batch
     
-    # Training parameters - adjust as needed for your EC2 instance capabilities
-    # These are smaller for a quicker demonstration. Increase for full training.
-    TRAIN_DATASET_SLICE = "train[:1%]" # e.g., "train[:5%]" or "train" for full
-    TEST_DATASET_SLICE = "test[:1%]"   # e.g., "test[:5%]" or "test" for full
-    NUM_TRAIN_EPOCHS_RUN1 = 1
-    NUM_TRAIN_EPOCHS_RUN2 = 1
-    PER_DEVICE_BATCH_SIZE_RUN1 = 1
-    GRAD_ACCUM_STEPS_RUN1 = 4
-    PER_DEVICE_BATCH_SIZE_RUN2 = 2 
-    GRAD_ACCUM_STEPS_RUN2 = 8      
-
-    # --- 1. Load Dataset ---
-    print_on_main_process("Loading dataset...")
-    try:
-        train_dataset, test_dataset = load_dataset(dataset_id, split=[TRAIN_DATASET_SLICE, TEST_DATASET_SLICE])
-    except Exception as e:
-        print_on_main_process(f"Failed to load specified dataset slice, trying with a smaller one: {e}")
-        train_dataset, test_dataset = load_dataset(dataset_id, split=["train[:100]", "test[:100]"])
-
-    print_on_main_process(f"Train dataset size: {len(train_dataset)}")
-    print_on_main_process(f"Test dataset size: {len(test_dataset)}")
-
-    # --- 2. Define System Prompt and Conversation Formatting ---
-    SYSTEM_PROMPT = (
-        "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-        "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-        "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-        "<think> reasoning process here </think><answer> answer here </answer>"
-    )
-
-    def make_conversation(example):
-        return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
-            ],
-            "solution": example["solution"] # Keep solution for reward calculation
-        }
-
-    # Inspect columns before mapping
-    print_on_main_process(f"Columns in train_dataset before map: {train_dataset.column_names}")
-    print_on_main_process(f"Columns in test_dataset before map: {test_dataset.column_names}")
-
-    # The make_conversation function uses 'problem' and 'solution'.
-    # 'messages' is the only original column not directly used by make_conversation and can be removed.
-    # 'grade', 'type', 'source' are NOT top-level columns in this specific dataset.
-    columns_to_remove_from_original = ["messages"] 
-
-    train_dataset = train_dataset.map(
-        make_conversation,
-        batched=True, 
-        remove_columns=columns_to_remove_from_original
-    )
-    test_dataset = test_dataset.map(
-        make_conversation,
-        batched=True,
-        remove_columns=columns_to_remove_from_original
-    )
+    # Completions is List[List[Dict[str, str]]], where outer list corresponds to prompts,
+    # inner list corresponds to `num_generations` per prompt.
+    # We need to align generated completions with their original solutions.
+    # GRPOTrainer calls reward_funcs with `completions` shaped (batch_size * num_generations, 1, dict)
+    # and `solution` will be of length `batch_size`. We need to repeat/align `solution`.
+    # The GRPOTrainer's documentation/source should clarify how kwargs are batched.
+    # Assuming `solution` corresponds to the prompts, and we have `num_generations` for each.
+    # Let's assume for now `completions` and `solutions` are aligned by GRPOTrainer or this needs adjustment.
+    # The provided example implies completions and solutions are already aligned or broadcasted.
+    # `completions` is (batch_size * num_generations), `solutions` is (batch_size)
+    # Let `num_generations` be from `training_args`.
     
-    # Inspect columns after mapping
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print_on_main_process(f"\nProcessed train_dataset sample (after map):")
-        print_on_main_process(train_dataset[0])
-        print_on_main_process(f"Columns in train_dataset after map: {train_dataset.column_names}")
-        print_on_main_process(f"Columns in test_dataset after map: {test_dataset.column_names}")
+    num_gens_per_prompt = kwargs.get("num_generations", 1) # Get from training_args if possible or infer
+    if "num_generations" not in kwargs and trainer_args: # Access from global if defined
+        num_gens_per_prompt = trainer_args.num_generations
 
+    expanded_solutions = []
+    for sol in solutions:
+        expanded_solutions.extend([sol] * num_gens_per_prompt)
 
-    # --- 3. Load Tokenizer and Model (for DDP, load on CPU first) ---
-    print_on_main_process(f"Loading tokenizer for {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token 
-        print_on_main_process("Tokenizer pad_token set to eos_token.")
+    completion_contents = [comp[0]["content"] for comp in completions if comp and comp[0] and "content" in comp[0]]
+    rewards = []
 
-    print_on_main_process(f"Loading model {model_id}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype="auto", 
-    )
-
-    # --- 4. Configure PEFT (LoRA) ---
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"], # Common for Qwen models, verify if different for 0.5B
-    )
-    model = get_peft_model(model, lora_config)
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        model.print_trainable_parameters()
-
-    # --- 5. Define Reward Functions ---
-    def format_reward(completions, **kwargs):
-        pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
-        # Ensure completions are strings and handle None
-        completion_contents = [str(comp[0]["content"]) if comp and len(comp) > 0 and comp[0].get("content") is not None else "" for comp in completions]
-        matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
-        return [1.0 if match else 0.0 for match in matches]
-
-    def accuracy_reward(completions, **kwargs):
-        solutions = kwargs["solution"] # This comes from the dataset items
-        completion_contents = [str(comp[0]["content"]) if comp and len(comp) > 0 and comp[0].get("content") is not None else "" for comp in completions]
-        rewards = []
-        for content, solution_text in zip(completion_contents, solutions):
-            gold_parsed = parse(str(solution_text), extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-            answer_parsed = parse(str(content), extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-            if len(gold_parsed) != 0:
+    for content, solution_text in zip(completion_contents, expanded_solutions):
+        gold_parsed = parse(solution_text, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+        # Extract from <answer> tag in generated content
+        answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+        if answer_match:
+            answer_text = answer_match.group(1).strip()
+            answer_parsed = parse(answer_text, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+            if len(gold_parsed) != 0 and len(answer_parsed) != 0:
                 try:
                     rewards.append(float(verify(answer_parsed, gold_parsed)))
                 except Exception:
-                    rewards.append(0.0)
-            else: # If gold solution is empty/unparsable
-                if len(answer_parsed) == 0 : # If answer is also empty/unparsable
-                     rewards.append(1.0)
-                else: # Gold empty, answer not
-                     rewards.append(0.0)
-        return rewards
+                    rewards.append(0.0) # Error during verification
+            elif len(gold_parsed) == 0 and len(answer_parsed) == 0 : # Both empty (e.g. non-math textual answer)
+                 rewards.append(1.0 if answer_text == solution_text else 0.0) # Simple string match for non-parsable
+            elif len(gold_parsed) == 0 and len(answer_parsed) != 0 : # Gold is empty, answer is not
+                rewards.append(0.0)
+            else: # Gold is not empty, answer is empty or unparsable
+                rewards.append(0.0)
+        else:
+            rewards.append(0.0) # No <answer> tag
+    return rewards
 
-    # --- 6. First Training Configuration and Run ---
-    print_on_main_process("\n--- Configuring First Training Run ---")
-    output_dir_run1 = "Qwen2-0.5B-GRPO-EC2-run1"
-    training_args_1 = GRPOConfig(
-        output_dir=output_dir_run1,
-        learning_rate=1e-5,
-        remove_unused_columns=False, # Important: GRPOTrainer needs 'solution' from dataset for accuracy_reward
-        gradient_accumulation_steps=GRAD_ACCUM_STEPS_RUN1,
-        num_train_epochs=NUM_TRAIN_EPOCHS_RUN1,
-        per_device_train_batch_size=PER_DEVICE_BATCH_SIZE_RUN1,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported() and torch.cuda.is_available(),
-        max_completion_length=64,
-        num_generations=2,
-        max_prompt_length=128,
-        report_to=["tensorboard"] if (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0) else "none",
-        logging_steps=10, 
-        push_to_hub=False,
-        save_strategy="steps",
-        save_steps=50, 
-        tokenizer=tokenizer,
-        ddp_find_unused_parameters=False 
-    )
+# --- Training Arguments and Trainer ---
+print("Configuring training arguments...")
+# Conditional mixed precision based on hardware support
+use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+use_fp16 = torch.cuda.is_available() and not use_bf16
 
-    trainer_1 = GRPOTrainer(
-        model=model,
-        reward_funcs=[format_reward, accuracy_reward],
-        args=training_args_1,
-        train_dataset=train_dataset,
-        # GRPOTrainer gets tokenizer from args if not passed directly
-    )
+# Global placeholder for training_args to be accessible by reward function if needed for num_generations
+trainer_args = None
+
+training_args = GRPOConfig(
+    output_dir=TRAINED_MODEL_DIR,
+    learning_rate=1e-5,       # Typical learning rate for fine-tuning
+    remove_unused_columns=False, # Crucial for accessing 'solution' in accuracy_reward
+    gradient_accumulation_steps=4, # Adjust based on VRAM. Original: 16. Reduced for wider compatibility.
+    num_train_epochs=1,        # Number of training epochs
+    bf16=use_bf16,             # Use bfloat16 if supported
+    fp16=use_fp16,             # Use float16 if bfloat16 not supported but CUDA is available
     
-    print_on_main_process("--- Starting First Training Run ---")
-    trainer_1.train()
-    print_on_main_process("--- First Training Run Completed ---")
+    # per_device_train_batch_size: From TrainingArguments, defaults to 8.
+    # This is the number of prompts processed for loss computation by one device.
+    per_device_train_batch_size=2, # Adjust based on VRAM. Original: 8 (default). Reduced.
+
+    # batch_size (for GRPO generation step): From GRPOConfig, defaults to 1.
+    # Number of prompts to generate completions for simultaneously.
+    # batch_size = 1, # Default in GRPOConfig
+
+    # Parameters controlling data preprocessing and generation during training
+    max_completion_length=128, # Max length of generated completions. Original: 64. Increased for math.
+    num_generations=2,         # Number of completions to generate per prompt. Original: 4. Reduced.
+    max_prompt_length=256,     # Max length of prompts. Original: 128. Increased.
+
+    # Reporting and saving
+    report_to="tensorboard",   # For EC2, consider "none" or ensure TensorBoard is set up.
+    logging_steps=10,
+    save_strategy="epoch",     # Save at the end of each epoch. Original: "steps"
+    # save_steps=10,           # Used if save_strategy="steps". Original: 10
+    # save_total_limit=1,      # Optional: limit the number of saved checkpoints
+    push_to_hub=False,         # Set to True to push to Hugging Face Hub
+    # hub_model_id="your-username/your-model-name", # Required if push_to_hub=True
+)
+trainer_args = training_args # Make it accessible globally for reward function
+
+tokenizer_for_training = AutoTokenizer.from_pretrained(model_id)
+if tokenizer_for_training.pad_token_id is None:
+    tokenizer_for_training.pad_token_id = tokenizer_for_training.eos_token_id
+    model.config.pad_token_id = model.config.eos_token_id # Ensure model config also updated
+
+trainer = GRPOTrainer(
+    model=model,
+    tokenizer=tokenizer_for_training, # Pass tokenizer to GRPOTrainer
+    reward_funcs=[format_reward, accuracy_reward],
+    args=training_args,
+    train_dataset=train_dataset,
+)
+
+print("Starting training...")
+trainer.train()
+print("Training finished.")
+
+# --- Save Model ---
+print(f"Saving fine-tuned model (adapter) and tokenizer to {TRAINED_MODEL_DIR}...")
+trainer.save_model(TRAINED_MODEL_DIR) # Saves adapter & tokenizer
+# tokenizer_for_training.save_pretrained(TRAINED_MODEL_DIR) # Trainer should do this
+print(f"Model and tokenizer saved to {TRAINED_MODEL_DIR}.")
+
+# Optional: Zip the model directory if needed for transfer
+# shutil.make_archive(f"{TRAINED_MODEL_DIR}_archive", "zip", TRAINED_MODEL_DIR)
+# print(f"Model archived to {TRAINED_MODEL_DIR}_archive.zip")
+
+
+# --- Inference with the Fine-tuned Model ---
+print("\n--- Starting Inference with the Fine-tuned Model ---")
+
+# Load the fine-tuned model (base model + adapter) and tokenizer
+# AutoModelForCausalLM.from_pretrained on a PEFT-saved directory
+# should load the base model and apply the adapter.
+print(f"Loading fine-tuned model from {TRAINED_MODEL_DIR} for inference...")
+try:
+    inference_model = AutoModelForCausalLM.from_pretrained(
+        TRAINED_MODEL_DIR,
+        torch_dtype="auto", # Use appropriate dtype
+        device_map="auto",  # Load on available device
+    )
+    # Tokenizer should have been saved by trainer.save_model()
+    inference_tokenizer = AutoTokenizer.from_pretrained(TRAINED_MODEL_DIR)
+    print("Successfully loaded fine-tuned model and tokenizer for inference.")
+except Exception as e:
+    print(f"Error loading model directly from {TRAINED_MODEL_DIR}: {e}")
+    print("Attempting fallback: loading base model and then attaching adapter...")
+    base_model_for_inference = AutoModelForCausalLM.from_pretrained(
+        model_id, # Base model ID
+        torch_dtype="auto",
+        device_map="auto",
+    )
+    inference_model = PeftModel.from_pretrained(base_model_for_inference, TRAINED_MODEL_DIR)
+    # Optional: merge LoRA weights for potentially faster inference if not done automatically.
+    # This replaces the model with the merged version.
+    # inference_model = inference_model.merge_and_unload()
+    inference_tokenizer = AutoTokenizer.from_pretrained(model_id) # Fallback to base tokenizer
+    print("Fallback loading complete.")
+
+# Ensure pad_token_id is set for the inference tokenizer
+if inference_tokenizer.pad_token_id is None:
+    inference_tokenizer.pad_token_id = inference_tokenizer.eos_token_id
+
+# Determine device for pipeline (GPU if available, else CPU)
+pipeline_device = 0 if torch.cuda.is_available() else -1
+
+print(f"Creating text-generation pipeline on device: {'cuda:0' if pipeline_device == 0 else 'cpu'}")
+gen_pipeline = pipeline(
+    'text-generation',
+    model=inference_model,
+    tokenizer=inference_tokenizer,
+    device=pipeline_device
+)
+
+# Test prompts
+prompts_for_testing = [
+    "Explain Group Relative Policy Optimization in simple terms.",
+    "In 1988, a person's age was equal to the sum of the digits of their birth year. How old was this person?"
+]
+
+for user_prompt_text in prompts_for_testing:
+    print(f"\nUser Prompt: {user_prompt_text}")
+
+    # Format the prompt using the chat template, including the system prompt used during training
+    messages_for_inference = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt_text},
+    ]
+
+    if inference_tokenizer.chat_template:
+        formatted_model_input = inference_tokenizer.apply_chat_template(
+            messages_for_inference,
+            tokenize=False,
+            add_generation_prompt=True  # Crucial for instruct models to know it's their turn
+        )
+    else:
+        # Fallback if no chat template (should not happen for Qwen2-Instruct)
+        print("Warning: Tokenizer does not have a chat template. Using basic formatting.")
+        formatted_model_input = f"{SYSTEM_PROMPT}\nUser: {user_prompt_text}\nAssistant:"
+
+    print(f"--- Formatted Input to Model ---\n{formatted_model_input}\n-------------------------------")
+
+    # Generate text
+    outputs = gen_pipeline(
+        formatted_model_input,
+        max_new_tokens=512,  # Max tokens for the generated response
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        #eos_token_id=inference_tokenizer.eos_token_id, # Pipeline usually handles this
+        #pad_token_id=inference_tokenizer.pad_token_id # Pipeline usually handles this
+    )
+
+    generated_full_text = outputs[0]['generated_text']
     
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        trainer_1.save_model(output_dir_run1)
-        print_on_main_process(f"Model from first run saved to {output_dir_run1}")
+    # Extract only the newly generated assistant's reply
+    # The `formatted_model_input` is what we sent.
+    # The `generated_full_text` contains this input + the model's generation.
+    assistant_reply = generated_full_text
+    if generated_full_text.startswith(formatted_model_input):
+        assistant_reply = generated_full_text[len(formatted_model_input):].strip()
+    else:
+        # If the pipeline behaves differently or input string had subtle changes (e.g. whitespace)
+        # try to find the last part based on assistant markers if possible.
+        # For Qwen2, this would be after "<|im_start|>assistant\n"
+        # This is a heuristic if the direct prefix strip fails.
+        assistant_marker = None
+        if "qwen2" in inference_tokenizer.name_or_path.lower():
+             assistant_marker = "<|im_start|>assistant" # Don't include \n as it might vary slightly
+
+        if assistant_marker:
+            last_occurrence_idx = generated_full_text.rfind(assistant_marker)
+            if last_occurrence_idx != -1:
+                # Find the end of the marker (e.g., after the newline)
+                end_of_marker_idx = generated_full_text.find("\n", last_occurrence_idx)
+                if end_of_marker_idx != -1:
+                     assistant_reply = generated_full_text[end_of_marker_idx+1:].strip()
+
+    # Clean up trailing special tokens like <|im_end|>
+    if assistant_reply.endswith(inference_tokenizer.eos_token) or \
+       (hasattr(inference_tokenizer, 'special_tokens_map') and \
+        'im_end_token' in inference_tokenizer.special_tokens_map and \
+        assistant_reply.endswith(inference_tokenizer.special_tokens_map['im_end_token'])):
+        
+        if assistant_reply.endswith(inference_tokenizer.eos_token):
+            assistant_reply = assistant_reply[:-len(inference_tokenizer.eos_token)].strip()
+        
+        if hasattr(inference_tokenizer, 'special_tokens_map') and \
+           'im_end_token' in inference_tokenizer.special_tokens_map and \
+           assistant_reply.endswith(inference_tokenizer.special_tokens_map['im_end_token']):
+           assistant_reply = assistant_reply[:-len(inference_tokenizer.special_tokens_map['im_end_token'])].strip()
 
 
-    # --- 7. Second Training Configuration (Optimized) and Run ---
-    print_on_main_process("\n--- Configuring Second Training Run (Optimized) ---")
-    output_dir_run2 = "Qwen2-0.5B-GRPO-EC2-run2-final"
-    training_args_2 = GRPOConfig(
-        output_dir=output_dir_run2,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported() and torch.cuda.is_available(),
-        per_device_train_batch_size=PER_DEVICE_BATCH_SIZE_RUN2,
-        gradient_accumulation_steps=GRAD_ACCUM_STEPS_RUN2,
-        num_generations=2, 
-        max_prompt_length=128,
-        max_completion_length=64,
-        logging_steps=20, 
-        save_strategy="epoch",
-        learning_rate=1e-5, 
-        num_train_epochs=NUM_TRAIN_EPOCHS_RUN2,
-        remove_unused_columns=False, # Keep 'solution'
-        report_to=["tensorboard"] if (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0) else "none",
-        push_to_hub=False,
-        tokenizer=tokenizer,
-        ddp_find_unused_parameters=False
-    )
+    print(f"--- Assistant's Reply ---\n{assistant_reply}\n-------------------------")
 
-    trainer_2 = GRPOTrainer(
-        model=model, 
-        reward_funcs=[format_reward, accuracy_reward],
-        args=training_args_2,
-        train_dataset=train_dataset, 
-    )
-
-    print_on_main_process("--- Starting Second Training Run ---")
-    trainer_2.train()
-    print_on_main_process("--- Second Training Run Completed ---")
-
-    # --- 8. Save the final model ---
-    final_output_dir = training_args_2.output_dir
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print_on_main_process(f"\nSaving final model to {final_output_dir}...")
-        trainer_2.save_model(final_output_dir)
-        print_on_main_process(f"Model saved to {final_output_dir}")
-
-        # --- 9. Zip up the model directory (optional, for easier transfer) ---
-        archive_name = "my_final_qwen2_model_ec2"
-        shutil.make_archive(archive_name, "zip", final_output_dir)
-        print_on_main_process(f"Model archived to {archive_name}.zip. You can transfer this file (e.g., to S3).")
-
-    # --- 10. Reloading the model and Inference Example (on main process or single GPU after training) ---
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print_on_main_process("\n--- Reloading and Inference Example (on main process) ---")
-        model_to_load_path = final_output_dir
-
-        try:
-            print_on_main_process(f"Loading tokenizer from: {model_to_load_path}")
-            reloaded_tokenizer = AutoTokenizer.from_pretrained(model_to_load_path)
-            if reloaded_tokenizer.pad_token is None: # Ensure pad token for generation
-                reloaded_tokenizer.pad_token = reloaded_tokenizer.eos_token
-
-            print_on_main_process(f"Loading model from: {model_to_load_path}")
-            reloaded_model = AutoModelForCausalLM.from_pretrained(
-                model_to_load_path,
-                device_map="auto", 
-                torch_dtype='auto'
-            )
-            print_on_main_process("Model and tokenizer reloaded successfully for inference.")
-
-            gen_pipeline = pipeline(
-                'text-generation',
-                model=reloaded_model,
-                tokenizer=reloaded_tokenizer,
-            )
-
-            prompts_for_inference = [
-                "Explain Group Relative Policy Optimization in simple terms:",
-                "In 1988, a person's age was equal to the sum of the digits of their birth year. How old was this person?"
-            ]
-
-            for i, prompt_text in enumerate(prompts_for_inference):
-                print_on_main_process(f"\n--- Running prompt {i+1} ---")
-                
-                # Format prompt for chat model
-                # The make_conversation was used to structure the training data.
-                # For inference, we create a similar structure for the prompt.
-                if "1988" in prompt_text: 
-                    conversation_input_for_inference = make_conversation({"problem": prompt_text, "solution": ""})["prompt"]
-                else: 
-                    conversation_input_for_inference = [{"role": "user", "content": prompt_text}]
-                
-                formatted_prompt_for_inference = reloaded_tokenizer.apply_chat_template(
-                    conversation_input_for_inference,
-                    tokenize=False,
-                    add_generation_prompt=True # Important for instruction-tuned models
-                )
-                print_on_main_process(f"Formatted Inference Prompt:\n{formatted_prompt_for_inference}")
-
-                outputs = gen_pipeline(
-                    formatted_prompt_for_inference, 
-                    max_new_tokens=250, # Increased for potentially longer math solutions
-                    do_sample=True, 
-                    temperature=0.7, 
-                    pad_token_id=reloaded_tokenizer.eos_token_id
-                )
-                
-                print_on_main_process("\nGenerated Output:")
-                full_generated_text = outputs[0]['generated_text']
-                print_on_main_process(full_generated_text)
-
-        except Exception as e:
-            print_on_main_process(f"Error during model reloading or inference: {e}")
-            print_on_main_process("Please ensure the model was saved correctly and the path is accessible.")
-
-    print_on_main_process("\n--- Script execution finished ---")
-
-if __name__ == "__main__":
-    # This will be run by torchrun, which handles DDP setup
-    main()
+print("\nScript finished.")
