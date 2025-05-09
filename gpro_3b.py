@@ -207,7 +207,7 @@ if tokenizer_for_training.pad_token_id is None:
 
 trainer = GRPOTrainer(
     model=model,
-    tokenizer=tokenizer_for_training, # Pass tokenizer to GRPOTrainer
+    processing_class=tokenizer_for_training, # Pass tokenizer to GRPOTrainer
     reward_funcs=[format_reward, accuracy_reward],
     args=training_args,
     train_dataset=train_dataset,
