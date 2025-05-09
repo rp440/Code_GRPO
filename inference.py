@@ -4,9 +4,9 @@ from peft import PeftModel
 import os
 
 # --- Configuration ---
-BASE_MODEL_ID = "Qwen/Qwen2-3B-Instruct" # The original base model ID
+BASE_MODEL_ID = "Qwen/Qwen2-0.5B-Instruct" # The original base model ID
 # Path to the directory where your fine-tuned adapter and tokenizer were saved
-FINETUNED_ADAPTER_DIR = "Qwen2-3B-GRPO-NuminaMath-DeepSpeed-Finetuned" # Or your actual TRAINED_MODEL_DIR
+FINETUNED_ADAPTER_DIR = "Qwen2-0.5B-GRPO-NuminaMath-Finetuned" # Or your actual TRAINED_MODEL_DIR
 
 # System prompt used during fine-tuning (important for consistency)
 SYSTEM_PROMPT = (
