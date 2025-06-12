@@ -1,3 +1,20 @@
+"""
+GPRO Matrix Multiplication DSL Training Script
+
+Key Features:
+1. Load previous LoRA checkpoint but discard optimizer state
+2. Create fresh AdamW optimizer with configurable learning rate  
+3. Reset value head parameters for fresh training
+4. New L1 error-based reward function:
+   - Correct result: score = (10 - mul_ops)
+   - Incorrect result: score = (-dist/5 - 0.2*mul_ops)
+
+Configuration:
+- Set LOAD_FROM_CHECKPOINT = False to train from scratch
+- Adjust CHECKPOINT_PATH to your previous model path
+- Modify NEW_LEARNING_RATE as needed
+"""
+
 import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
@@ -7,33 +24,37 @@ import os
 import shutil
 import ast
 from datetime import datetime
-from datasets import load_dataset # Changed from Dataset, IterableDataset
+from datasets import load_dataset
 from huggingface_hub import login
 from trl import GRPOConfig, GRPOTrainer
 import random
+import json
+import math
 
 # --- 0. Hugging Face Login ---
 try:
     login_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if login_token:
         login(token=login_token, add_to_git_credential=False)
-        print("Hugging Face Hub login successful.")
+        print("[SUCCESS] Hugging Face Hub login successful.")
     else:
-        print("HUGGING_FACE_HUB_TOKEN not found.")
+        print("[WARNING] HUGGING_FACE_HUB_TOKEN not found.")
 except Exception as e:
-    print(f"Hugging Face Hub login attempt issue: {e}")
+    print(f"[ERROR] Hugging Face Hub login attempt issue: {e}")
 
 # --- 1. Mount Google Drive & Paths ---
 DRIVE_MOUNT_PATH = '/content/drive'
 MODEL_SAVE_PARENT_DIR_DRIVE = os.path.join(DRIVE_MOUNT_PATH, "MyDrive", "Matmul_GPRO_Finetuned_JSONL")
-DATASET_PATH = "/content/matrix_io_data_for_grpo.jsonl" # Your specified dataset path
+TENSORBOARD_LOGS_DRIVE = os.path.join(DRIVE_MOUNT_PATH, "MyDrive", "Matmul_GPRO_TensorBoard_Logs")
+DATASET_PATH = "/content/matrix_io_data_for_grpo.jsonl"
 
 try:
     print("Mounting Google Drive...")
     drive.mount(DRIVE_MOUNT_PATH, force_remount=True)
     print(f"Google Drive mounted.")
     os.makedirs(MODEL_SAVE_PARENT_DIR_DRIVE, exist_ok=True)
-    print(f"Ensured save directory: {MODEL_SAVE_PARENT_DIR_DRIVE}")
+    os.makedirs(TENSORBOARD_LOGS_DRIVE, exist_ok=True)
+    print(f"Ensured save directories: {MODEL_SAVE_PARENT_DIR_DRIVE}, {TENSORBOARD_LOGS_DRIVE}")
     USE_DRIVE_FOR_SAVING = True
 except Exception as e:
     print(f"Could not mount Google Drive: {e}")
@@ -71,23 +92,66 @@ class DSLExecutor:
             raise ValueError(f"Malformed DSL step (missing '='): '{original_step_line}'")
 
         target_var, expression = [s.strip() for s in step_line.split('=', 1)]
-        op_match = re.match(r"^\s*([\w\[\],\s\.\d\-]+)\s*([*+])\s*([\w\[\],\s\.\d\-]+)\s*$", expression)
-        assign_match = re.match(r"^\s*([\w\[\],\s\.\d\-]+)\s*$", expression)
-
-        if op_match:
-            op1_name = op_match.group(1).strip()
-            operator = op_match.group(2).strip()
-            op2_name = op_match.group(3).strip()
+        
+        # Handle chained operations (e.g., M1 + M4 - M5 + M7)
+        result = self._evaluate_expression(expression, original_step_line)
+        self.variables[target_var] = result
+    
+    def _evaluate_expression(self, expression, original_step_line):
+        """Evaluate an expression that may contain chained +/- operations"""
+        expression = expression.strip()
+        
+        # Simple assignment (no operators) - check for variable names or numbers only
+        # Must be: variable name, matrix element, or number (no spaces around operators)
+        assign_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
+        if assign_match:
+            return self._get_value(assign_match.group(1).strip())
+        
+        # Single binary operation (backward compatibility)
+        binary_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*([*+-])\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
+        if binary_match:
+            op1_name = binary_match.group(1).strip()
+            operator = binary_match.group(2).strip()
+            op2_name = binary_match.group(3).strip()
             val1 = self._get_value(op1_name)
             val2 = self._get_value(op2_name)
-            if operator == '+': result = val1 + val2
-            elif operator == '*': result = val1 * val2
+            if operator == '+': return val1 + val2
+            elif operator == '*': return val1 * val2
+            elif operator == '-': return val1 - val2
             else: raise ValueError(f"Unsupported operator '{operator}' in expression: '{expression}'")
-        elif assign_match:
-            result = self._get_value(assign_match.group(1).strip())
-        else:
+        
+        # Chained operations (e.g., M1 + M4 - M5 + M7)
+        # Split by + and - while preserving operators, but be careful with negative numbers
+        tokens = re.split(r'(\s*[+-]\s*)', expression)
+        if len(tokens) == 1:
             raise ValueError(f"Malformed expression: '{expression}' in DSL line: '{original_step_line}'")
-        self.variables[target_var] = result
+        
+        # First term (no leading operator)
+        first_term = tokens[0].strip()
+        result = self._get_value(first_term)
+        
+        # Process remaining terms with their operators
+        i = 1
+        while i < len(tokens):
+            if i + 1 >= len(tokens):
+                break
+            operator = tokens[i].strip()
+            operand = tokens[i + 1].strip()
+            
+            # Skip empty tokens from splitting
+            if not operator or not operand:
+                i += 2
+                continue
+                
+            value = self._get_value(operand)
+            
+            if operator == '+': result += value
+            elif operator == '-': result -= value
+            else: raise ValueError(f"Unsupported operator '{operator}' in chained expression: '{expression}'")
+            
+            i += 2
+        
+        return result
 
     def run_dsl_and_get_c(self, dsl_script_string):
         steps = dsl_script_string.strip().split('\n')
@@ -113,7 +177,7 @@ def manual_matrix_multiply_2x2(A, B):
     C[1][1] = A[1][0] * B[0][1] + A[1][1] * B[1][1]
     return C
 
-def _generate_random_2x2_matrix_for_inference(low=-99, high=99): # Simpler range for inference example
+def _generate_random_2x2_matrix_for_inference(low=-99, high=99):
     return [[random.randint(low, high) for _ in range(2)] for _ in range(2)]
 
 A_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
@@ -121,41 +185,89 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2.5-1.5B" # Changed to a more recent Qwen model
-ADAPTER_PATH = "/content/gemma-text-to-sql/checkpoint-171" # Example path, adjust if needed
+BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2.5-1.5B"
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
-LOCAL_TRAINED_MODEL_PATH = f"./{TRAINED_MODEL_DIR_NAME}"
+LOCAL_TRAINED_MODEL_PATH = f"/content/{TRAINED_MODEL_DIR_NAME}"
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Configuration for checkpoint loading and fresh training
+CHECKPOINT_PATH = "/Qwen2.5-1.5B-GRPO-MatMulDSL-JSONL_lr2e-05_epochs2_batch5_gradacc12_20250608_202137"  # Path to previous LoRA checkpoint
+NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
+LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
+
+# Always use Drive for saving - create descriptive names with parameters
+EPOCHS = 2
+BATCH_SIZE = 5  # Per-device batch size for better GPU utilization
+GRAD_ACC_STEPS = 12  # 5 prompts * 8 generations * 12 steps = 480 total completions
+# Total effective batch size: 480 completions with rewards processed in batches
+model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}"  # Include key training params
+drive_model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
+drive_logs_name = f"runs_{model_config_desc}_{timestamp}"
+
 if USE_DRIVE_FOR_SAVING:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    DRIVE_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_PARENT_DIR_DRIVE, f"{TRAINED_MODEL_DIR_NAME}_{timestamp}")
+    DRIVE_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_PARENT_DIR_DRIVE, drive_model_name)
+    DRIVE_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DRIVE, drive_logs_name)
+    print(f"[SAVE CONFIG] Model will be saved to: {DRIVE_TRAINED_MODEL_PATH}")
+    print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {DRIVE_TENSORBOARD_PATH}")
 else:
     DRIVE_TRAINED_MODEL_PATH = None
+    DRIVE_TENSORBOARD_PATH = None
+    print("[WARNING] Drive saving is disabled - models will only be saved locally")
 
-SYSTEM_MESSAGE = """You are an AI assistant. Your ONLY task is to output the COMPLETE sequence of VALID DSL lines to perform a 2x2 matrix multiplication (C = A * B), with each DSL line on a new line. The solution MUST use a total of 7 multiplications or fewer. The input matrices A and B will have integer elements.
+SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
 
-STRICT RULES:
+EXAMPLE DSL OUTPUT FORMAT:
+For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:
 
-Adhere strictly to the DSL formats defined below for each line in the sequence.
-NO PYTHON code. NO EXPLANATIONS. Output only the DSL lines.
-The generated sequence must correctly implement a 2x2 matrix multiplication algorithm (C = A * B) using 7 or fewer multiplications.
-Use M-variables for intermediate products/terms and S-variables for sums of products before C assignment.
-If you cannot determine a valid full DSL sequence, output ONLY: Error: Cannot determine full sequence.
+I'll generate the DSL script for matrix multiplication:
 
-DSL FORMAT DEFINITIONS:
-Intermediate Vars (M, S): <VAR_TYPE><id> = <operand1> {+/*} <operand2> OR <VAR_TYPE><id> = <operand>
-Output Matrix: C[<row>,<col>] = <S_or_M_operand>
-Operands: A[r,c], B[r,c], M<id>, S<id>. Indices 0 or 1.
-Goal: Calculate C = A * B using <= 7 multiplications."""
+<DSL> 
+M1 = A[0,0] * B[0,0]
+M2 = A[0,1] * B[1,0] 
+S1 = M1 + M2 
+C[0,0] = S1
+M3 = A[0,0] * B[0,1]
+M4 = A[0,1] * B[1,1]
+S2 = M3 + M4
+C[0,1] = S2
+M5 = A[1,0] * B[0,0]
+M6 = A[1,1] * B[1,0]
+S3 = M5 + M6
+C[1,0] = S3
+M7 = A[1,1] * B[1,1]
+S4 = M7 - M6
+C[1,1] = S4
+</DSL>
 
-# This will be complemented by specific matrix info if available in the dataset's 'user_query' field
+
+
+This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.
+
+YOUR TASK:
+Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags.
+
+DSL SYNTAX RULES:
+- M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0])
+- S variables: Store addition/subtraction results (e.g., S1 = M1 + M2)
+- Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1}
+- Final output: C[row,col] = result
+- Operations: + (addition), * (multiplication), - (subtraction)
+- Variable assignment: VAR = expression
+
+REQUIREMENTS:
+- Use ≤7 multiplications total within the <DSL></DSL> tags
+- Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1]
+- Wrap DSL code in <DSL></DSL> tags
+- You may add explanations outside the tags
+
+If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
+
 DEFAULT_USER_PROMPT_FOR_DSL_GENERATION = "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications."
 
 # --- 4. Dataset Preparation from JSONL ---
 def preprocess_jsonl_data(item):
     """
     Prepares a single item from the JSONL dataset.
-    Assumes item might have 'matrix_A_list', 'matrix_B_list' or 'A_matrix_str', 'B_matrix_str'.
-    Also looks for 'user_query'.
     """
     matrix_a = None
     matrix_b = None
@@ -165,9 +277,9 @@ def preprocess_jsonl_data(item):
         try:
             matrix_a = item["matrix_A_list"]
             matrix_b = item["matrix_B_list"]
-            if not (isinstance(matrix_a, list) and isinstance(matrix_b, list)): # Basic check
-                matrix_a, matrix_b = None, None # Fallback if not list
-        except: # Catch any error during access/conversion
+            if not (isinstance(matrix_a, list) and isinstance(matrix_b, list)):
+                matrix_a, matrix_b = None, None
+        except:
             matrix_a, matrix_b = None, None
             
     # Fallback: Try to get matrices as strings and parse them
@@ -176,7 +288,7 @@ def preprocess_jsonl_data(item):
             matrix_a = ast.literal_eval(item["A_matrix_str"])
         except:
             print(f"Warning: Could not parse A_matrix_str: {item.get('A_matrix_str')}")
-            matrix_a = [[0,0],[0,0]] # Default to avoid crash, but this data point will be poor.
+            matrix_a = [[0,0],[0,0]]
     if matrix_b is None and "B_matrix_str" in item:
         try:
             matrix_b = ast.literal_eval(item["B_matrix_str"])
@@ -184,13 +296,11 @@ def preprocess_jsonl_data(item):
             print(f"Warning: Could not parse B_matrix_str: {item.get('B_matrix_str')}")
             matrix_b = [[0,0],[0,0]]
 
-    # If matrices couldn't be loaded, this data point is problematic for the current reward
+    # If matrices couldn't be loaded, use defaults
     if matrix_a is None or matrix_b is None:
         print(f"Error: Could not determine matrix A or B for dataset item: {item}. Using placeholder matrices.")
-        # Provide some default so it doesn't crash, but reward will be meaningless for this sample
         matrix_a = [[1,1],[1,1]]
         matrix_b = [[1,1],[1,1]]
-        # Consider raising an error or filtering these items if they are common
 
     # Calculate expected C
     try:
@@ -199,12 +309,7 @@ def preprocess_jsonl_data(item):
         print(f"Error calculating expected_C for A={matrix_a}, B={matrix_b}: {e}. Using placeholder C.")
         expected_c = [[0,0],[0,0]]
 
-
     user_content = item.get("user_query", DEFAULT_USER_PROMPT_FOR_DSL_GENERATION)
-    # Optionally, append matrix info to user prompt if not already there, for LLM context
-    # if "A=" not in user_content and "B=" not in user_content: # Basic check
-    #    user_content += f" (A={str(matrix_a)}, B={str(matrix_b)})"
-
 
     return {
         "prompt": [
@@ -214,89 +319,105 @@ def preprocess_jsonl_data(item):
         "A_matrix_str": str(matrix_a),
         "B_matrix_str": str(matrix_b),
         "expected_C_str": str(expected_c),
-        # "target_dsl_solution": item.get("target_dsl_solution", "") # If you have target DSLs
     }
 
 print(f"Loading dataset from: {DATASET_PATH}")
+print("*** IMPORTANT: Make sure you have run dataset.py to generate the dataset file first! ***")
+
 try:
-    # Check if dataset file actually exists
+    # Check if dataset file exists (must be generated by dataset.py)
     if not os.path.exists(DATASET_PATH):
-        print(f"Dataset file not found: {DATASET_PATH}")
-        print("Creating a minimal sample dataset for testing purposes...")
-        
-        # Create a simple sample dataset
-        sample_data = [
-            {
-                "matrix_A_list": [[1, 2], [3, 4]],
-                "matrix_B_list": [[5, 6], [7, 8]],
-                "user_query": "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications."
-            },
-            {
-                "matrix_A_list": [[2, 1], [1, 2]],
-                "matrix_B_list": [[3, 0], [1, 3]],
-                "user_query": "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications."
-            }
-        ]
-        
-        import json
-        with open(DATASET_PATH, 'w') as f:
-            for item in sample_data:
-                f.write(json.dumps(item) + '\n')
-        print(f"Created sample dataset at: {DATASET_PATH}")
+        print(f"[ERROR] Dataset file not found at {DATASET_PATH}")
+        print("[REQUIRED] Please run dataset.py first to generate the training dataset!")
+        print("[INFO] The dataset.py script should create the JSONL file with matrix multiplication examples.")
+        exit(1)
     
+    print(f"[SUCCESS] Found dataset file at: {DATASET_PATH}")
+    
+    # Check file size to ensure it's not empty
+    file_size = os.path.getsize(DATASET_PATH)
+    print(f"[INFO] Dataset file size: {file_size} bytes")
+    
+    if file_size == 0:
+        print("[ERROR] Dataset file is empty!")
+        print("[REQUIRED] Please run dataset.py to generate proper training data.")
+        exit(1)
+    
+    # Load the dataset generated by dataset.py
     raw_dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
-    # Filter out problematic data if necessary, e.g., if matrices couldn't be parsed.
-    # For now, preprocess_jsonl_data uses defaults if parsing fails.
-    train_dataset_for_grpo = raw_dataset.map(
-        preprocess_jsonl_data,
-        # batched=True, # Can be faster if preprocess_jsonl_data handles batches
-        # num_proc=4 # If dataset is large
-    )
-    # Remove columns not needed by GRPOTrainer or custom reward function, if any were left from raw load
-    # GRPOTrainer with remove_unused_columns=False will keep A_matrix_str etc.
-    # columns_to_keep = ["prompt", "A_matrix_str", "B_matrix_str", "expected_C_str"]
-    # columns_to_remove = [col for col in train_dataset_for_grpo.column_names if col not in columns_to_keep]
-    # if columns_to_remove:
-    #    train_dataset_for_grpo = train_dataset_for_grpo.remove_columns(columns_to_remove)
+    train_dataset_for_grpo = raw_dataset.map(preprocess_jsonl_data)
 
-    print(f"Processed dataset. Number of samples: {len(train_dataset_for_grpo)}")
-    if len(train_dataset_for_grpo) > 0:
-        print(f"First processed sample: {train_dataset_for_grpo[0]}")
-    else:
-        raise ValueError("Dataset is empty after processing. Check JSONL path and content.")
+    print(f"[SUCCESS] Processed dataset. Number of samples: {len(train_dataset_for_grpo)}")
+    
+    if len(train_dataset_for_grpo) == 0:
+        print("[ERROR] No valid samples found after processing!")
+        print("[CHECK] Check the format of your dataset.py generated file.")
+        exit(1)
+    
+    print(f"[SAMPLE] First processed sample keys: {list(train_dataset_for_grpo[0].keys())}")
+    print(f"[SAMPLE] Sample A matrix: {train_dataset_for_grpo[0]['A_matrix_str']}")
+    print(f"[SAMPLE] Sample B matrix: {train_dataset_for_grpo[0]['B_matrix_str']}")
+    
 except Exception as e:
-    print(f"Failed to load or process dataset from {DATASET_PATH}: {e}")
-    print("Exiting due to dataset error.")
-    exit()
+    print(f"[ERROR] Failed to load or process dataset from {DATASET_PATH}: {e}")
+    print("[TIP] Make sure dataset.py has been run and generated a valid JSONL file.")
+    print("[FORMAT] Expected format: Each line should be a JSON object with matrix data.")
+    exit(1)
 
-
-# --- 5. Model Loading and PEFT Setup ---
-print(f"Loading base model for fine-tuning: {BASE_MODEL_NAME_FOR_FINETUNING}")
-model_for_finetuning = AutoModelForCausalLM.from_pretrained(
+# --- 5. Model Loading and PEFT Setup (Load Previous LoRA) ---
+print(f"Loading base model: {BASE_MODEL_NAME_FOR_FINETUNING}")
+base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME_FOR_FINETUNING,
     torch_dtype="auto",
     device_map="auto",
     trust_remote_code=True
 )
 
-# Load existing finetuned adapter instead of creating fresh LoRA
-print(f"Loading existing adapter from: {ADAPTER_PATH}")
-try:
-    model_peft = PeftModel.from_pretrained(model_for_finetuning, ADAPTER_PATH)
-    print("Existing adapter loaded successfully.")
-except Exception as e:
-    print(f"Error loading adapter from {ADAPTER_PATH}: {e}")
-    print("Falling back to fresh LoRA configuration...")
-    # Fallback to fresh LoRA if adapter loading fails
+# Load previous LoRA checkpoint or create fresh LoRA
+if LOAD_FROM_CHECKPOINT:
+    print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
+    try:
+        model_peft = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
+        print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
+        
+        # CRITICAL: Enable gradients for LoRA parameters after loading checkpoint
+        for name, param in model_peft.named_parameters():
+            if 'lora_' in name.lower():
+                param.requires_grad = True
+        print("[FIX] Enabled gradients for LoRA parameters")
+        
+    except Exception as e:
+        print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
+        LOAD_FROM_CHECKPOINT = False  # Force fresh creation
+        
+if not LOAD_FROM_CHECKPOINT:
+    print("Creating fresh LoRA configuration...")
     lora_config = LoraConfig(
         task_type="CAUSAL_LM",
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], # Updated for Qwen2.5 architecture
+        r=16, 
+        lora_alpha=32, 
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         bias="none"
     )
-    model_peft = get_peft_model(model_for_finetuning, lora_config)
+    model_peft = get_peft_model(base_model, lora_config)
 
 model_peft.print_trainable_parameters()
+
+# Fresh optimizer with new learning rate
+from torch.optim import AdamW
+optimizer = AdamW(model_peft.parameters(), lr=NEW_LEARNING_RATE)
+print(f"[SUCCESS] Created fresh AdamW optimizer with lr={NEW_LEARNING_RATE}")
+
+# Reset value head parameters if it exists
+try:
+    if hasattr(model_peft, 'v_head') and model_peft.v_head is not None:
+        model_peft.v_head.reset_parameters()
+        print("[SUCCESS] Reset value head parameters")
+    else:
+        print("[INFO] No value head found to reset")
+except Exception as e:
+    print(f"[WARNING] Could not reset value head: {e}")
 
 tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
 if tokenizer_for_training.pad_token is None:
@@ -305,15 +426,65 @@ if tokenizer_for_training.pad_token is None:
 if tokenizer_for_training.padding_side == 'right':
     tokenizer_for_training.padding_side = 'left'
 
-# --- 6. Reward Function for GRPO ---
-_num_generations_per_prompt_for_reward = 2
+# --- 6. Reward Function for GRPO with L2 Distance Based Scoring ---
+_num_generations_per_prompt_for_reward = 10
+_reward_call_count = 0
+_best_n_mults = float('inf')  # Track the best number of multiplications found so far
+
+# New reward hyperparameters
+CORRECT_7_MULT_BONUS = 5.0  # +5 for correct 7 multiplication solutions
+NEAR_MISS_PENALTY = -15.0   # -1 for near-miss (8×, ≤6×) 
+WEIRD_ANSWER_PENALTY = -20.0   # -10 for weird/incorrect answers
+TAG_BONUS = 0.1  # +0.1 for DSL tags
+
+# Exploration formula: -1.06×10^-8 * ||AB-C||^2 + 6
+# Ranges ≈[-11, 6], so best exploration > correct (5), worst < weird (-10)
+EXPLORATION_SCALE = -10.0 / 1.59936e17
+# print(exploration_scale)  # → approximately -6.252006252006252e-17
+  # Scale factor for L2 squared distance
+EXPLORATION_OFFSET = 6.0      # Offset to ensure best exploration > correct answers
+
+# Discovery logging setup
+timestamp_for_discoveries = datetime.now().strftime("%Y%m%d_%H%M%S")
+DISCOVERIES_LOG_FILE = f"/content/dsl_discoveries_{timestamp_for_discoveries}.txt"
+DISCOVERIES_DRIVE_FILE = os.path.join(MODEL_SAVE_PARENT_DIR_DRIVE, f"dsl_discoveries_{timestamp_for_discoveries}.txt") if USE_DRIVE_FOR_SAVING else None
+
+def log_discovery(message, dsl_script=None):
+    """Log discoveries to both file and console"""
+    full_message = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    print(f"**DISCOVERY** {full_message}")
+    
+    # Write to local file
+    with open(DISCOVERIES_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{full_message}\n")
+        if dsl_script:
+            f.write(f"DSL Script:\n{dsl_script}\n")
+            f.write("-" * 50 + "\n")
+    
+    # Copy to Drive if enabled
+    if DISCOVERIES_DRIVE_FILE:
+        try:
+            import shutil
+            shutil.copy2(DISCOVERIES_LOG_FILE, DISCOVERIES_DRIVE_FILE)
+        except Exception as e:
+            print(f"[WARNING] Could not copy discoveries log to Drive: {e}")
+
+# Initialize discovery log
+log_discovery(f"DISCOVERY LOG STARTED - Training Session {timestamp_for_discoveries}")
+log_discovery(f"Exploration-Prioritized Scoring: -1.06e-8*||AB-C||²+6 for exploration (capped at -4 for 7-mult), +5 for correct 7-mult, -15 for near-miss, -10 for weird answers, +0.1 for DSL tags, min -19 for solvable DSL")
 
 def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
-    global _num_generations_per_prompt_for_reward
+    global _num_generations_per_prompt_for_reward, _reward_call_count, _best_n_mults
+    _reward_call_count += 1
+    
     A_matrix_str_list = kwargs["A_matrix_str"]
     B_matrix_str_list = kwargs["B_matrix_str"]
     expected_C_str_list = kwargs["expected_C_str"]
     rewards = []
+
+    print(f"\n=== NEW REWARD CALCULATION CALL #{_reward_call_count} ===")
+    print(f"Processing {len(completions)} completions...")
+    print(f"Current best multiplications: {_best_n_mults if _best_n_mults != float('inf') else 'None found yet'}")
 
     for i, dsl_script_raw_content in enumerate(completions):
         prompt_idx = i // _num_generations_per_prompt_for_reward
@@ -326,188 +497,327 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
             B = ast.literal_eval(current_B_str)
             expected_C = ast.literal_eval(current_expected_C_str)
         except Exception as e:
-            print(f"Reward function: Error parsing matrices for completion {i}: {e}")
-            rewards.append(-20.0) # Severe penalty for data error in reward
+            print(f"  Completion {i}: Error parsing matrices: {e}")
+            rewards.append(WEIRD_ANSWER_PENALTY + TAG_BONUS)
             continue
 
-        # Ensure dsl_script_raw_content is a string - handle chat format from GRPO
+        # Handle different completion formats and extract content
         if isinstance(dsl_script_raw_content, list):
             if len(dsl_script_raw_content) == 1:
                 item = dsl_script_raw_content[0]
                 if isinstance(item, dict) and 'role' in item and 'content' in item:
-                    # Chat format: [{'role': 'assistant', 'content': '...'}]
-                    processed_dsl_script = item['content']
+                    processed_content = item['content']
                 elif isinstance(item, str):
-                    # List containing a single string
-                    processed_dsl_script = item
+                    processed_content = item
                 else:
-                    print(f"Warning: Reward function received unhandled list item at index {i}: {item}. Skipping.")
-                    rewards.append(-50.0)
-                    continue
+                    processed_content = str(item)
             else:
-                print(f"Warning: Reward function received list with {len(dsl_script_raw_content)} items at index {i}. Skipping.")
-                rewards.append(-50.0)
-                continue
+                processed_content = str(dsl_script_raw_content)
         elif isinstance(dsl_script_raw_content, dict) and 'role' in dsl_script_raw_content and 'content' in dsl_script_raw_content:
-            # Single chat format: {'role': 'assistant', 'content': '...'}
-            processed_dsl_script = dsl_script_raw_content['content']
+            processed_content = dsl_script_raw_content['content']
         elif isinstance(dsl_script_raw_content, str):
-            # Already a string
-            processed_dsl_script = dsl_script_raw_content
+            processed_content = dsl_script_raw_content
         else:
-            print(f"Warning: Reward function received unhandled completion type at index {i}: {type(dsl_script_raw_content)}. Skipping.")
-            rewards.append(-50.0)
-            continue
+            processed_content = str(dsl_script_raw_content)
 
-        # Robust construction of tokens to remove
+        # Extract DSL content (with or without tags)
+        dsl_match = re.search(r'<DSL>(.*?)</DSL>', processed_content, re.DOTALL | re.IGNORECASE)
+        if dsl_match:
+            dsl_content = dsl_match.group(1).strip()
+            print(f"  Completion {i}: [PASS] DSL tags found!")
+            tag_bonus = TAG_BONUS
+        else:
+            dsl_content = processed_content
+            print(f"  Completion {i}: [WARNING] No <DSL></DSL> tags found")
+            tag_bonus = 0.0
+        
+        # Clean up special tokens from DSL content
         temp_tokens_to_remove = ["<|im_end|>", "<|endoftext|>", "<|file_separator|>"]
         if hasattr(tokenizer_for_training, 'all_special_tokens') and tokenizer_for_training.all_special_tokens is not None:
             valid_special_tokens = [
                 str(t) for t in tokenizer_for_training.all_special_tokens
-                if t is not None and isinstance(t, str) and t # Ensure t is a non-empty string
+                if t is not None and isinstance(t, str) and t
             ]
             temp_tokens_to_remove.extend(valid_special_tokens)
         
-        # Add eos_token if not already covered and is a string
         if tokenizer_for_training.eos_token and isinstance(tokenizer_for_training.eos_token, str):
             temp_tokens_to_remove.append(tokenizer_for_training.eos_token)
 
-        unique_tokens_to_remove = list(set(t for t in temp_tokens_to_remove if t)) # Ensure unique and non-empty
+        unique_tokens_to_remove = list(set(t for t in temp_tokens_to_remove if t))
 
-        # At this point, processed_dsl_script is guaranteed to be a string.
-        # And unique_tokens_to_remove contains only non-empty strings.
         for token_str in unique_tokens_to_remove:
-            processed_dsl_script = processed_dsl_script.replace(token_str, "")
+            dsl_content = dsl_content.replace(token_str, "")
 
-        lines = processed_dsl_script.split('\n')
+        lines = dsl_content.split('\n')
         cleaned_lines = [line.strip() for line in lines if line.strip()]
         final_dsl_script = "\n".join(cleaned_lines)
 
         if not final_dsl_script or final_dsl_script.strip().lower() == "error: cannot determine full sequence.":
-            rewards.append(-10.0)
+            print(f"  Completion {i}: Empty or error DSL script. Reward: {WEIRD_ANSWER_PENALTY + tag_bonus:.1f}")
+            rewards.append(WEIRD_ANSWER_PENALTY + tag_bonus)
             continue
             
-        base_score = 0
+        # Parse and Execute DSL
         num_multiplications = 0
+        reward = 0.0
+        
         try:
+            # Count multiplications
             for line in final_dsl_script.split('\n'):
                 if re.search(r"=\s*[\w\[\],\s\.\d\-]+\s*\*\s*[\w\[\],\s\.\d\-]+", line.strip()):
                     num_multiplications += 1
             
-            # Re-initialize DSLExecutor for each script with the correct A and B
+            # Execute DSL
             executor = DSLExecutor(A, B)
             C_dsl = executor.run_dsl_and_get_c(final_dsl_script)
 
-            if C_dsl == expected_C:
-                base_score = 10.0 # Positive reward for correctness
+            # NEW EXPLORATION-PRIORITIZED SCORING SYSTEM
+            # Calculate L2 squared distance for all cases
+            l2_sq_distance = 0.0
+            for r in range(2):
+                for c in range(2):
+                    diff = C_dsl[r][c] - expected_C[r][c]
+                    l2_sq_distance += diff * diff
+            
+            if num_multiplications == 7:
+                # PRIORITIZED: 7-multiplication solutions get exploration formula with L2 distance capped at max -10
+                # Formula: -1.06×10^-8 * ||AB-C||^2 + 6, but capped at minimum of -4 (6 - 10)
+                base_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
+                reward = max(base_reward, EXPLORATION_OFFSET - 10.0)  # Cap L2 penalty at max -10
+                
+                if C_dsl == expected_C:
+                    print(f"  Completion {i}: **PERFECT** Correct 7-multiplication solution! (L2²={l2_sq_distance:.0f}, reward={reward:.3f})")
+                    
+                    # Log the perfect solution
+                    log_discovery(f"PERFECT 7-MULT SOLUTION! Score: {reward:.3f}", final_dsl_script)
+                    log_discovery(f"Test matrices: A={A}, B={B}, Expected C={expected_C}")
+                    
+                    if num_multiplications < _best_n_mults:
+                        _best_n_mults = num_multiplications
+                else:
+                    print(f"  Completion {i}: **7-MULT EXPLORATION** L2²={l2_sq_distance:.0f}, reward={reward:.3f} (capped)")
+                    print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
+                    
+            elif C_dsl == expected_C:
+                # CORRECT DSL but not 7-multiplication - use fixed penalty for near-miss
+                reward = NEAR_MISS_PENALTY  # -15 for near-miss (correct but not 7-mult)
+                print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult (near-miss penalty: {NEAR_MISS_PENALTY})")
+                
+                if num_multiplications < _best_n_mults:
+                    _best_n_mults = num_multiplications
+                    log_discovery(f"NEW BEST SOLUTION! {num_multiplications} multiplications", final_dsl_script)
+                    
             else:
-                base_score = -5.0 # Penalty for incorrect result
-        except ValueError as e: # Catch DSL parsing/execution errors
-            # print(f"Reward function: DSL execution error for script:\n---\n{final_dsl_script}\n---\nError: {e}")
-            base_score = -7.0 # Penalty for invalid DSL structure
-        except Exception as e: # Catch any other unexpected error during execution
-            # print(f"Reward function: Unexpected error during DSL execution: {e} for script:\n---\n{final_dsl_script}\n---")
-            base_score = -8.0
-            num_multiplications += 5 # Penalize unexpected errors more
+                # INCORRECT non-7-multiplication solutions - use exploration formula but ensure lower priority
+                base_exploration_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
+                
+                # Ensure non-7-mult incorrect solutions are always worse than weird answers threshold
+                # by capping them at slightly above weird answer penalty
+                reward = min(base_exploration_reward, WEIRD_ANSWER_PENALTY + 1.0)
+                
+                print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mul attempt. L2²={l2_sq_distance:.0f}, reward={reward:.3f}")
+                print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
+            
+            # Ensure no solvable DSL gets reward less than -19
+            reward = max(reward, -19.0)
+
+        except Exception as e:
+            # FAILED EXECUTION - weird answer penalty
+            reward = WEIRD_ANSWER_PENALTY
+            print(f"  Completion {i}: **EXECUTION FAILED**: {str(e)[:100]}...")
+            print(f"  Completion {i}: Weird answer penalty: {reward:.1f}")
         
-        # Reward calculation: correctness minus complexity (number of multiplications)
-        # We want fewer multiplications.
-        reward_value = base_score - float(num_multiplications)
-        rewards.append(reward_value)
+        # Final reward with tag bonus
+        final_reward = reward + tag_bonus
+        rewards.append(final_reward)
         
+        if tag_bonus > 0:
+            print(f"  Completion {i}: Final reward: {final_reward:.1f} (base: {reward:.1f}, tag bonus: +{tag_bonus:.1f})")
+        else:
+            print(f"  Completion {i}: Final reward: {final_reward:.1f}")
+        
+    print(f"Batch average reward: {sum(rewards)/len(rewards):.2f}")
+    print(f"Current global best: {_best_n_mults if _best_n_mults != float('inf') else 'None'} multiplications")
+    print("=" * 50)
     return rewards
 
 # --- 7. Training Arguments and GRPOTrainer ---
 print("Configuring training arguments for GRPO...")
-use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-use_fp16 = torch.cuda.is_available() and not use_bf16
+# Remove device-specific settings - let the system handle device allocation automatically
+use_bf16 = False  # Disable bf16 to avoid device-specific optimizations
+use_fp16 = False  # Disable fp16 to avoid device-specific optimizations
+
+# Setup TensorBoard logging directory
+local_tensorboard_dir = os.path.join(LOCAL_TRAINED_MODEL_PATH, "runs")
+os.makedirs(local_tensorboard_dir, exist_ok=True)
+
+# Always use local directory for TensorBoard logging to avoid connection issues
+# We'll copy to Drive after training completes
+actual_tensorboard_dir = local_tensorboard_dir
 
 training_args_grpo = GRPOConfig(
-    output_dir=LOCAL_TRAINED_MODEL_PATH,
-    learning_rate=2e-5, # Tunable
-    remove_unused_columns=False, # CRITICAL for reward function to access dataset columns
-    gradient_accumulation_steps=4,
-    num_train_epochs=1, # Adjust based on dataset size and desired training
-    bf16=use_bf16, fp16=use_fp16,
-    per_device_train_batch_size=2, # Number of prompts for loss computation
-    max_completion_length=350, # Max length of generated DSL
+    output_dir=DRIVE_TRAINED_MODEL_PATH if USE_DRIVE_FOR_SAVING else LOCAL_TRAINED_MODEL_PATH,  # Save directly to Drive
+    learning_rate=NEW_LEARNING_RATE,  # Use the configurable learning rate
+    remove_unused_columns=False,
+    gradient_accumulation_steps=GRAD_ACC_STEPS,
+    num_train_epochs=EPOCHS,
+    bf16=use_bf16, 
+    fp16=use_fp16,
+    per_device_train_batch_size=BATCH_SIZE,
+    max_completion_length=500,
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=600, # System prompt + user query (with matrices) can be long
-    logging_steps=10, # Log more frequently
-    save_strategy="epoch",
-    report_to="tensorboard", # Enable TensorBoard
+    max_prompt_length=1000,
+    logging_steps=5,
+    save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
+    save_steps=100,  # Save checkpoint every 100 steps
+    logging_dir=actual_tensorboard_dir,  # TensorBoard logs to the correct directory
+    report_to="tensorboard",
     push_to_hub=False,
-    # chat_template=tokenizer_for_training.chat_template or tokenizer_for_training.default_chat_template,
-    # GRPOTrainer will handle tokenization using the passed tokenizer.
+    dataloader_drop_last=True,  # Changed to True to ensure consistent batches
+    warmup_steps=5,  # Reduced warmup steps
+    dataloader_num_workers=0,  # Disable multiprocessing to avoid batch issues
 )
 
 model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
 
+# Validate dataset before training
+print(f"Dataset validation:")
+print(f"  - Dataset size: {len(train_dataset_for_grpo)}")
+print(f"  - Dataset features: {train_dataset_for_grpo.features}")
+if len(train_dataset_for_grpo) == 0:
+    print("[ERROR] Dataset is empty!")
+    exit()
+
 trainer_grpo = GRPOTrainer(
     model=model_peft,
-    # tokenizer=tokenizer_for_training,  # Re-enable tokenizer - required for GRPO
+    # NOTE: tokenizer parameter removed - old tokenizer API causes UnboundLocalError: 'current_batch' 
+    # GRPOTrainer will use the tokenizer from the model automatically
     reward_funcs=[matrix_dsl_reward],
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,
-    # eval_dataset=eval_dataset_for_grpo, # Optional: if you have an eval set
+    optimizers=(optimizer, None),  # Use our custom optimizer, no scheduler
 )
 
 print("Starting GRPO training...")
-print(f"TensorBoard logs will be saved in: {LOCAL_TRAINED_MODEL_PATH}/runs")
-print(f"To view TensorBoard, run: tensorboard --logdir={os.path.join(LOCAL_TRAINED_MODEL_PATH, 'runs')}") # Corrected path for launch command
+print(f"  - Per-device batch size: {training_args_grpo.per_device_train_batch_size}")
+print(f"  - Gradient accumulation steps: {training_args_grpo.gradient_accumulation_steps}")
+print(f"  - Total effective batch size: {training_args_grpo.per_device_train_batch_size * training_args_grpo.gradient_accumulation_steps}")
+print(f"  - Learning rate: {training_args_grpo.learning_rate}")
+print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
+print(f"TensorBoard logs will be saved locally in: {actual_tensorboard_dir}")
+if USE_DRIVE_FOR_SAVING and DRIVE_TENSORBOARD_PATH:
+    print(f"Logs will be copied to Drive after training: {DRIVE_TENSORBOARD_PATH}")
+print(f"To view TensorBoard in Colab, run: %load_ext tensorboard")
+print(f"%tensorboard --logdir {actual_tensorboard_dir}")
+
+# Start TensorBoard in Colab
+try:
+    # Load TensorBoard extension and start it
+    get_ipython().run_line_magic('load_ext', 'tensorboard')
+    get_ipython().run_line_magic('tensorboard', f'--logdir {actual_tensorboard_dir}')
+    print(f"TensorBoard started successfully! Logs directory: {actual_tensorboard_dir}")
+except:
+    print("Note: TensorBoard extension not loaded (not in notebook environment)")
+    print(f"To manually start TensorBoard, run: %tensorboard --logdir {actual_tensorboard_dir}")
+
 trainer_grpo.train()
 print("GRPO Training finished.")
 
-# --- 8. Save Model ---
+# Log final discovery summary
+final_best = _best_n_mults if _best_n_mults != float('inf') else 'None found'
+log_discovery(f"TRAINING COMPLETED - Final best: {final_best} multiplications")
+log_discovery(f"Discoveries log saved to: {DISCOVERIES_LOG_FILE}")
+if DISCOVERIES_DRIVE_FILE:
+    log_discovery(f"Discoveries log copied to Drive: {DISCOVERIES_DRIVE_FILE}")
+
+# --- 8. Save Model and Copy to Drive ---
 print(f"Saving fine-tuned model to {LOCAL_TRAINED_MODEL_PATH}...")
 trainer_grpo.save_model(LOCAL_TRAINED_MODEL_PATH)
+
+# Always attempt to save to Drive
 if USE_DRIVE_FOR_SAVING and DRIVE_TRAINED_MODEL_PATH:
-    print(f"Copying model to Google Drive: {DRIVE_TRAINED_MODEL_PATH}...")
+    print(f"\n=== SAVING TO GOOGLE DRIVE ===")
+    print(f"Drive Model Path: {DRIVE_TRAINED_MODEL_PATH}")
+    print(f"Model Config: lr={NEW_LEARNING_RATE}, epochs={EPOCHS}, batch={BATCH_SIZE}, grad_acc={GRAD_ACC_STEPS}")
+    
     try:
-        if os.path.exists(DRIVE_TRAINED_MODEL_PATH): # shutil.copytree fails if dst exists
+        # Ensure parent directory exists
+        os.makedirs(os.path.dirname(DRIVE_TRAINED_MODEL_PATH), exist_ok=True)
+        
+        if os.path.exists(DRIVE_TRAINED_MODEL_PATH):
+            print(f"[INFO] Removing existing model at {DRIVE_TRAINED_MODEL_PATH}")
             shutil.rmtree(DRIVE_TRAINED_MODEL_PATH)
+        
+        print(f"[COPYING] Copying model to Google Drive...")
         shutil.copytree(LOCAL_TRAINED_MODEL_PATH, DRIVE_TRAINED_MODEL_PATH)
-        print(f"Model copied to {DRIVE_TRAINED_MODEL_PATH}")
+        
+        # Verify the copy was successful
+        if os.path.exists(DRIVE_TRAINED_MODEL_PATH):
+            saved_files = os.listdir(DRIVE_TRAINED_MODEL_PATH)
+            print(f"[SUCCESS] Model saved to Drive with {len(saved_files)} files")
+            print(f"[SUCCESS] Final model path: {DRIVE_TRAINED_MODEL_PATH}")
+        else:
+            print(f"[ERROR] Model directory not found after copy operation")
+            
     except Exception as e:
-        print(f"Error copying model to Drive: {e}")
+        print(f"[ERROR] Failed to copy model to Drive: {e}")
+        print(f"[FALLBACK] Model remains available locally at: {LOCAL_TRAINED_MODEL_PATH}")
+    
+    # Copy TensorBoard logs to Drive
+    if DRIVE_TENSORBOARD_PATH and os.path.exists(local_tensorboard_dir):
+        print(f"\n[COPYING] TensorBoard logs to Google Drive: {DRIVE_TENSORBOARD_PATH}")
+        try:
+            os.makedirs(os.path.dirname(DRIVE_TENSORBOARD_PATH), exist_ok=True)
+            if os.path.exists(DRIVE_TENSORBOARD_PATH):
+                shutil.rmtree(DRIVE_TENSORBOARD_PATH)
+            shutil.copytree(local_tensorboard_dir, DRIVE_TENSORBOARD_PATH)
+            print(f"[SUCCESS] TensorBoard logs copied to: {DRIVE_TENSORBOARD_PATH}")
+        except Exception as e:
+            print(f"[ERROR] Error copying TensorBoard logs to Drive: {e}")
+            print(f"[FALLBACK] TensorBoard logs remain available locally at: {local_tensorboard_dir}")
 else:
-    print(f"Model saved locally at: {LOCAL_TRAINED_MODEL_PATH}")
+    print(f"[WARNING] Drive saving disabled - Model saved locally only at: {LOCAL_TRAINED_MODEL_PATH}")
+    print(f"[WARNING] To enable Drive saving, ensure Google Drive is mounted and USE_DRIVE_FOR_SAVING=True")
 
 # --- 9. Inference and Verification ---
 print("\n--- Inference with GRPO Fine-tuned Model ---")
 try:
     print(f"Loading fine-tuned model from: {LOCAL_TRAINED_MODEL_PATH}")
     inference_base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", trust_remote_code=True)
     inference_model = PeftModel.from_pretrained(inference_base_model, LOCAL_TRAINED_MODEL_PATH)
-    inference_model = inference_model.merge_and_unload() # Merge for potentially faster inference
+    inference_model = inference_model.merge_and_unload()
     
-    # Load tokenizer from base model, not from LOCAL_TRAINED_MODEL_PATH (which might not have tokenizer files)
     inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-    if inference_tokenizer.pad_token is None: inference_tokenizer.pad_token = inference_tokenizer.eos_token
-    if inference_tokenizer.padding_side == 'right': inference_tokenizer.padding_side = 'left'
-    print("Fine-tuned model loaded for inference.")
+    if inference_tokenizer.pad_token is None: 
+        inference_tokenizer.pad_token = inference_tokenizer.eos_token
+    if inference_tokenizer.padding_side == 'right': 
+        inference_tokenizer.padding_side = 'left'
+    print("[SUCCESS] Fine-tuned model loaded for inference.")
 except Exception as e:
-    print(f"Error loading fine-tuned model: {e}")
-    print("Falling back to base model for inference...")
+    print(f"[ERROR] Error loading fine-tuned model: {e}")
+    print("[FALLBACK] Falling back to base model for inference...")
     try:
         inference_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", trust_remote_code=True)
         inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-        if inference_tokenizer.pad_token is None: inference_tokenizer.pad_token = inference_tokenizer.eos_token
-        if inference_tokenizer.padding_side == 'right': inference_tokenizer.padding_side = 'left'
-        print("Using base model for inference.")
+        if inference_tokenizer.pad_token is None: 
+            inference_tokenizer.pad_token = inference_tokenizer.eos_token
+        if inference_tokenizer.padding_side == 'right': 
+            inference_tokenizer.padding_side = 'left'
+        print("[FALLBACK] Using base model for inference.")
     except Exception as fallback_e:
-        print(f"Error loading base model for inference: {fallback_e}. Exiting.")
+        print(f"[ERROR] Error loading base model for inference: {fallback_e}. Exiting.")
         exit()
 
-text_gen_pipeline = pipeline("text-generation", model=inference_model, tokenizer=inference_tokenizer, device=0 if torch.cuda.is_available() else -1)
+text_gen_pipeline = pipeline(
+    "text-generation", 
+    model=inference_model, 
+    tokenizer=inference_tokenizer
+)
 
-# Use the predefined A_INFERENCE_MATRIX and B_INFERENCE_MATRIX for testing
-user_query_for_inference = DEFAULT_USER_PROMPT_FOR_DSL_GENERATION # Generic prompt
-# Append specific matrix info to the prompt for the LLM, as it might not be in the generic prompt
+user_query_for_inference = DEFAULT_USER_PROMPT_FOR_DSL_GENERATION
 user_query_for_inference += f" (Using A={str(A_INFERENCE_MATRIX)}, B={str(B_INFERENCE_MATRIX)})"
-
 
 inference_chat_messages = [
     {"role": "system", "content": SYSTEM_MESSAGE},
@@ -517,17 +827,23 @@ formatted_inference_prompt = inference_tokenizer.apply_chat_template(
     inference_chat_messages, tokenize=False, add_generation_prompt=True)
 
 print(f"\nGenerating DSL for A={A_INFERENCE_MATRIX}, B={B_INFERENCE_MATRIX}")
-print(f"Input prompt to model:\n{formatted_inference_prompt[:500]}...") # Print start of prompt
+print(f"Expected result: {C_EXPECTED_INFERENCE_RESULT}")
 
 outputs = text_gen_pipeline(
-    formatted_inference_prompt, max_new_tokens=350, do_sample=False, temperature=0.1, top_p=0.9,
-    pad_token_id=inference_tokenizer.pad_token_id, eos_token_id=inference_tokenizer.eos_token_id)
+    formatted_inference_prompt, 
+    max_new_tokens=350, 
+    do_sample=False, 
+    temperature=0.1, 
+    top_p=0.9,
+    pad_token_id=inference_tokenizer.pad_token_id, 
+    eos_token_id=inference_tokenizer.eos_token_id
+)
 
 generated_full_text = outputs[0]['generated_text']
 assistant_reply_raw = generated_full_text
 if generated_full_text.startswith(formatted_inference_prompt):
     assistant_reply_raw = generated_full_text[len(formatted_inference_prompt):].strip()
-else: # Fallback for pipeline differences
+else:
     assistant_marker = "<|im_start|>assistant"
     last_occurrence_idx = generated_full_text.rfind(assistant_marker)
     if last_occurrence_idx != -1:
@@ -536,7 +852,7 @@ else: # Fallback for pipeline differences
             assistant_reply_raw = generated_full_text[start_of_reply_idx+1:].strip()
 
 tokens_to_clean = ["<|im_end|>", "<|endoftext|>"] + ([inference_tokenizer.eos_token] if inference_tokenizer.eos_token else [])
-unique_tokens_to_clean = list(set(t for t in tokens_to_clean if t)) # Ensure unique and not None
+unique_tokens_to_clean = list(set(t for t in tokens_to_clean if t))
 for token in unique_tokens_to_clean:
     if assistant_reply_raw.endswith(token):
         assistant_reply_raw = assistant_reply_raw[:-len(token)].strip()
@@ -548,10 +864,10 @@ cleaned_lines = [line.strip() for line in lines if line.strip()]
 final_generated_dsl = "\n".join(cleaned_lines)
 
 if not final_generated_dsl or final_generated_dsl.strip().lower() == "error: cannot determine full sequence.":
-    print("❌ FAILED: Model did not generate a valid DSL script or explicitly errored.")
+    print("[FAILED] Model did not generate a valid DSL script or explicitly errored.")
 else:
     try:
-        executor = DSLExecutor(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX) # Use the inference matrices
+        executor = DSLExecutor(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
         C_generated = executor.run_dsl_and_get_c(final_generated_dsl)
         num_mults_generated = sum(1 for line in final_generated_dsl.split('\n') if re.search(r"=\s*[\w\[\],\s\.\d\-]+\s*\*\s*[\w\[\],\s\.\d\-]+", line.strip()))
 
@@ -560,12 +876,26 @@ else:
         print(f"  Expected C:  {C_EXPECTED_INFERENCE_RESULT}")
 
         if C_generated == C_EXPECTED_INFERENCE_RESULT:
-            print(f"✅ PASSED: Algorithmically correct.")
-            if num_mults_generated <= 7: print(f"    Efficient: {num_mults_generated} multiplications (<= 7).")
-            else: print(f"    Suboptimal: {num_mults_generated} multiplications (> 7).")
+            print(f"[PASSED] Algorithmically correct.")
+            if num_mults_generated <= 7: 
+                print(f"    [EFFICIENT] {num_mults_generated} multiplications (<= 7).")
+            else: 
+                print(f"    [SUBOPTIMAL] {num_mults_generated} multiplications (> 7).")
         else:
-            print("❌ FAILED: Algorithmically INCORRECT.")
-    except ValueError as e: print(f"❌ FAILED: Invalid DSL or execution error: {e}")
-    except Exception as e: print(f"❌ FAILED: Unexpected verification error: {e}"); import traceback; traceback.print_exc()
+            print("[FAILED] Algorithmically INCORRECT.")
+    except ValueError as e: 
+        print(f"[FAILED] Invalid DSL or execution error: {e}")
+    except Exception as e: 
+        print(f"[FAILED] Unexpected verification error: {e}")
 
-print("\nScript finished.")
+print(f"\n*** SCRIPT COMPLETED SUCCESSFULLY ***")
+print(f"[SAVED] Model saved to: {DRIVE_TRAINED_MODEL_PATH if USE_DRIVE_FOR_SAVING else LOCAL_TRAINED_MODEL_PATH}")
+print(f"[LOGS] TensorBoard logs (local): {actual_tensorboard_dir}")
+if USE_DRIVE_FOR_SAVING and DRIVE_TENSORBOARD_PATH:
+    print(f"[LOGS] TensorBoard logs (Drive): {DRIVE_TENSORBOARD_PATH}")
+print(f"[DISCOVERIES] Local: {DISCOVERIES_LOG_FILE}")
+if DISCOVERIES_DRIVE_FILE:
+    print(f"[DISCOVERIES] Drive: {DISCOVERIES_DRIVE_FILE}")
+final_best_summary = _best_n_mults if _best_n_mults != float('inf') else 'None found'
+print(f"[BEST SOLUTION] {final_best_summary} multiplications")
+print(f"[TIP] To restart TensorBoard: %tensorboard --logdir {actual_tensorboard_dir}")
