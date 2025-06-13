@@ -17,7 +17,7 @@ def generate_random_matrix(low=-9999, high=9999):
     """Generates a 2x2 matrix with random integer elements."""
     return [[random.randint(low, high) for _ in range(2)] for _ in range(2)]
 
-def generate_matrix_io_dataset(num_examples=1000):
+def generate_matrix_io_dataset(num_examples=10):
     """
     Generates a dataset containing input matrices A, B and the expected output matrix C.
     This format is suitable for tasks where the LLM might be asked to directly predict
@@ -75,7 +75,7 @@ def generate_matrix_io_dataset(num_examples=1000):
 
 if __name__ == '__main__':
     # --- Configuration ---
-    NUM_EXAMPLES_TO_GENERATE = 1000
+    NUM_EXAMPLES_TO_GENERATE = 10
     # Output filename suitable for the GRPO script, assuming it needs A, B, and C.
     # The GRPO script's `preprocess_jsonl_data` function expects `A_matrix_str`, `B_matrix_str`,
     # and calculates `expected_C_str` from them.

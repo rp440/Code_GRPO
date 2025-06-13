@@ -11,6 +11,10 @@ pip install transformers peft datasets trl tensorboard accelerate
 mkdir -p /home/ec2-user/matmul_outputs/models
 mkdir -p /home/ec2-user/matmul_outputs/tensorboard_logs
 
+# Generate dataset first
+echo "Generating training dataset..."
+python dataset.py
+
 # Set Hugging Face token (replace with your token)
 # export HUGGING_FACE_HUB_TOKEN="your_token_here"
 
