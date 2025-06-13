@@ -660,17 +660,16 @@ if 'RANK' in os.environ:
         "ddp_find_unused_parameters": False,
         "ddp_broadcast_buffers": False,
         "dataloader_pin_memory": False,
-        # Set distributed environment variables
-        "world_size": int(os.environ.get('WORLD_SIZE', 1)),
-        "process_index": int(os.environ.get('RANK', 0)),
-        "local_rank": int(os.environ.get('LOCAL_RANK', 0)),
+        # Note: world_size, process_index, local_rank are handled automatically by torch.distributed.launch
     })
-    print(f"[DISTRIBUTED] Configured for distributed training with {distributed_args}")
+    print(f"[DISTRIBUTED] Configured for distributed training")
+    print(f"[DISTRIBUTED] Environment: RANK={os.environ.get('RANK')}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
 else:
     distributed_args.update({
         "ddp_find_unused_parameters": False,
         "dataloader_pin_memory": False,
     })
+    print(f"[SINGLE GPU] Configured for single GPU training")
 
 training_args_grpo = GRPOConfig(
     output_dir=FINAL_MODEL_PATH,
