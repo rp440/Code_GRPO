@@ -197,9 +197,9 @@ LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
 # Always use Drive for saving - create descriptive names with parameters
 EPOCHS = 1
-BATCH_SIZE = 1  # Keep small batch size for memory efficiency
-GRAD_ACC_STEPS = 4  # Increase gradient accumulation to compensate for small batch size
-# Total effective batch size: 1 * 4 = 4 completions with rewards processed in batches
+BATCH_SIZE = 1  # Per-device batch size for better GPU utilization
+GRAD_ACC_STEPS = 2  # 5 prompts * 8 generations * 12 steps = 480 total completions
+# Total effective batch size: 480 completions with rewards processed in batches
 model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}"  # Include key training params
 drive_model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
 drive_logs_name = f"runs_{model_config_desc}_{timestamp}"
@@ -346,11 +346,6 @@ base_model = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     trust_remote_code=True
 )
-
-# Configure model for gradient checkpointing
-base_model.config.use_cache = False  # Disable KV cache for gradient checkpointing
-base_model.gradient_checkpointing_enable()
-print("[INFO] Enabled gradient checkpointing and disabled KV cache for memory efficiency")
 
 # Load previous LoRA checkpoint or create fresh LoRA
 if LOAD_FROM_CHECKPOINT:
@@ -624,7 +619,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
 print("Configuring training arguments for GRPO...")
 # Remove device-specific settings - let the system handle device allocation automatically
 use_bf16 = False  # Disable bf16 to avoid device-specific optimizations
-use_fp16 = True  # Enable FP16 for memory efficiency
+use_fp16 = False  # Disable fp16 to avoid device-specific optimizations
 
 # Setup TensorBoard logging directory
 local_tensorboard_dir = os.path.join(LOCAL_TRAINED_MODEL_PATH, "runs")
