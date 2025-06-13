@@ -39,7 +39,7 @@ from torch.utils.data.distributed import DistributedSampler
 BASE_OUTPUT_DIR = "/home/ec2-user/matmul_outputs"
 MODEL_SAVE_DIR = os.path.join(BASE_OUTPUT_DIR, "models")
 TENSORBOARD_LOGS_DIR = os.path.join(BASE_OUTPUT_DIR, "tensorboard_logs")
-DATASET_PATH = "/home/ec2-user/matrix_io_data_for_grpo.jsonl"
+DATASET_PATH = "./matrix_io_data_for_grpo.jsonl"
 
 # Create necessary directories
 os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
