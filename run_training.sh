@@ -18,12 +18,13 @@ python dataset.py
 # Set Hugging Face token (replace with your token)
 # export HUGGING_FACE_HUB_TOKEN="your_token_here"
 
-# Run the training script (single GPU first to avoid distributed issues)
-# For distributed training, uncomment the lines below:
+# Run the training script with distributed training (4 GPUs)
+# CRITICAL: --use_env flag is required for proper environment variable handling
 python -m torch.distributed.launch \
     --nproc_per_node=4 \
     --master_port=29500 \
+    --use_env \
     GPRO_matmul_ec2.py
 
-# Single GPU training (more stable)
-CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py 
+# For single GPU training, use this instead:
+# CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py 

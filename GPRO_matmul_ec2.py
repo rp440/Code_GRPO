@@ -34,6 +34,17 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
+# --- Initialize Distributed Training Environment ---
+# CRITICAL: Initialize distributed environment before model loading
+if 'RANK' in os.environ:
+    print(f"[DISTRIBUTED] Initializing distributed training...")
+    print(f"[DISTRIBUTED] RANK: {os.environ.get('RANK')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK')}, WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    print(f"[DISTRIBUTED] Set CUDA device to: {torch.cuda.current_device()}")
+else:
+    print("[SINGLE GPU] Running in single GPU mode")
+
 # --- 1. Paths Configuration ---
 # Base directory for all outputs
 BASE_OUTPUT_DIR = "/home/ec2-user/matmul_outputs"
@@ -181,15 +192,22 @@ CHECKPOINT_PATH = "/home/ec2-user/previous_checkpoint"  # Update this path
 NEW_LEARNING_RATE = 2e-5
 LOAD_FROM_CHECKPOINT = True
 
-# Training configuration - Start with single GPU to avoid distributed issues
-# To enable multi-GPU training:
-# 1. Change NUM_GPUS to 4
-# 2. Reduce BATCH_SIZE_PER_GPU to 2 and GRAD_ACC_STEPS to 4
-# 3. Use distributed launch in run_training.sh
+# Training configuration - Auto-detect distributed vs single GPU
 EPOCHS = 1
-BATCH_SIZE_PER_GPU = 4  # Increased batch size since we're using single GPU
-GRAD_ACC_STEPS = 8      # Increased gradient accumulation to maintain effective batch size
-NUM_GPUS = 1            # Single GPU for stability (can be changed to 4 later)
+
+# Auto-configure based on distributed environment
+if 'WORLD_SIZE' in os.environ:
+    # Multi-GPU distributed training
+    NUM_GPUS = int(os.environ['WORLD_SIZE'])
+    BATCH_SIZE_PER_GPU = 2  # Reduced for multi-GPU to fit in T4 memory
+    GRAD_ACC_STEPS = 4      # Reduced since we have more GPUs
+    print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
+else:
+    # Single GPU training
+    NUM_GPUS = 1
+    BATCH_SIZE_PER_GPU = 4  # Increased batch size for single GPU
+    GRAD_ACC_STEPS = 8      # Increased gradient accumulation
+    print(f"[CONFIG] Single GPU mode")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -339,10 +357,21 @@ except Exception as e:
 
 # --- 5. Model Loading and PEFT Setup ---
 print(f"Loading base model: {BASE_MODEL_NAME_FOR_FINETUNING}")
+
+# Configure device map for distributed vs single GPU
+if 'RANK' in os.environ:
+    # Distributed training - don't use device_map="auto"
+    device_map = None
+    print("[DISTRIBUTED] Loading model without device_map for distributed training")
+else:
+    # Single GPU - use device_map="auto"
+    device_map = "auto"
+    print("[SINGLE GPU] Loading model with device_map='auto'")
+
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME_FOR_FINETUNING,
     torch_dtype=TORCH_DTYPE,  # Use FP16 for T4 GPUs
-    device_map="auto",
+    device_map=device_map,
     trust_remote_code=True
 )
 
@@ -623,6 +652,26 @@ print("Configuring training arguments for GRPO...")
 use_bf16 = False  # T4s don't support bfloat16
 use_fp16 = True   # Use FP16 for T4 GPUs
 
+# Configure distributed training arguments
+distributed_args = {}
+if 'RANK' in os.environ:
+    distributed_args.update({
+        # CRITICAL: Disable problematic distributed features
+        "ddp_find_unused_parameters": False,
+        "ddp_broadcast_buffers": False,
+        "dataloader_pin_memory": False,
+        # Set distributed environment variables
+        "world_size": int(os.environ.get('WORLD_SIZE', 1)),
+        "process_index": int(os.environ.get('RANK', 0)),
+        "local_rank": int(os.environ.get('LOCAL_RANK', 0)),
+    })
+    print(f"[DISTRIBUTED] Configured for distributed training with {distributed_args}")
+else:
+    distributed_args.update({
+        "ddp_find_unused_parameters": False,
+        "dataloader_pin_memory": False,
+    })
+
 training_args_grpo = GRPOConfig(
     output_dir=FINAL_MODEL_PATH,
     learning_rate=NEW_LEARNING_RATE,
@@ -632,7 +681,7 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    max_completion_length=16000,
+    max_completion_length=8000,  # Reduced from 16000 for memory efficiency
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=1000,
     logging_steps=5,
@@ -647,10 +696,8 @@ training_args_grpo = GRPOConfig(
     gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
-    # Fix for distributed training tensor issues
-    dataloader_pin_memory=False,
-    # Disable problematic distributed features
-    ddp_find_unused_parameters=False,
+    # Apply distributed configuration
+    **distributed_args,
 )
 
 model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
@@ -679,7 +726,14 @@ print(f"  - Gradient accumulation steps: {GRAD_ACC_STEPS}")
 print(f"  - Total effective batch size: {TOTAL_BATCH_SIZE}")
 print(f"  - Learning rate: {training_args_grpo.learning_rate}")
 print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
-print(f"  - Training mode: Single GPU (CUDA_VISIBLE_DEVICES=0)")
+
+# Show training mode
+if 'RANK' in os.environ:
+    print(f"  - Training mode: Distributed ({NUM_GPUS} GPUs)")
+    print(f"  - Current rank: {os.environ.get('RANK')}/{os.environ.get('WORLD_SIZE')}")
+else:
+    print(f"  - Training mode: Single GPU")
+
 print(f"TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 
 trainer_grpo.train()
