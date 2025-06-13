@@ -185,7 +185,7 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2.5-1.5B"
+BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = f"/content/{TRAINED_MODEL_DIR_NAME}"
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -196,10 +196,10 @@ NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
 LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
 # Always use Drive for saving - create descriptive names with parameters
-EPOCHS = 2
-BATCH_SIZE = 5  # Per-device batch size for better GPU utilization
-GRAD_ACC_STEPS = 12  # 5 prompts * 8 generations * 12 steps = 480 total completions
-# Total effective batch size: 480 completions with rewards processed in batches
+EPOCHS = 1
+BATCH_SIZE = 1  # Keep small batch size for memory efficiency
+GRAD_ACC_STEPS = 4  # Increase gradient accumulation to compensate for small batch size
+# Total effective batch size: 1 * 4 = 4 completions with rewards processed in batches
 model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}"  # Include key training params
 drive_model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
 drive_logs_name = f"runs_{model_config_desc}_{timestamp}"
@@ -215,54 +215,28 @@ else:
     print("[WARNING] Drive saving is disabled - models will only be saved locally")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
-
-EXAMPLE DSL OUTPUT FORMAT:
-For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:
-
-I'll generate the DSL script for matrix multiplication:
-
-<DSL> 
-M1 = A[0,0] * B[0,0]
-M2 = A[0,1] * B[1,0] 
-S1 = M1 + M2 
-C[0,0] = S1
+  EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  I'll generate the DSL script for matrix multiplication:  
+<DSL> M1 = A[0,0] * B[0,0] M2 = A[0,1] * B[1,0] S1 = M1 + M2 C[0,0] = S1
 M3 = A[0,0] * B[0,1]
 M4 = A[0,1] * B[1,1]
 S2 = M3 + M4
 C[0,1] = S2
+
 M5 = A[1,0] * B[0,0]
 M6 = A[1,1] * B[1,0]
 S3 = M5 + M6
 C[1,0] = S3
+
 M7 = A[1,1] * B[1,1]
 S4 = M7 - M6
 C[1,1] = S4
-</DSL>
+</DSL>  
+This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.  YOUR TASK: Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags. 
+DSL SYNTAX RULES: - M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0]) - S variables:
+ Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
+  REQUIREMENTS: - Use ≤7 multiplications total within the <DSL></DSL> tags - Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1] - Wrap DSL code in <DSL></DSL> tags - You may add explanations outside the tags  If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
 
-
-
-This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.
-
-YOUR TASK:
-Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags.
-
-DSL SYNTAX RULES:
-- M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0])
-- S variables: Store addition/subtraction results (e.g., S1 = M1 + M2)
-- Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1}
-- Final output: C[row,col] = result
-- Operations: + (addition), * (multiplication), - (subtraction)
-- Variable assignment: VAR = expression
-
-REQUIREMENTS:
-- Use ≤7 multiplications total within the <DSL></DSL> tags
-- Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1]
-- Wrap DSL code in <DSL></DSL> tags
-- You may add explanations outside the tags
-
-If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
-
-DEFAULT_USER_PROMPT_FOR_DSL_GENERATION = "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications."
+DEFAULT_USER_PROMPT_FOR_DSL_GENERATION = "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications.First think about answer then respond in <DSL></DSL> tags."
 
 # --- 4. Dataset Preparation from JSONL ---
 def preprocess_jsonl_data(item):
@@ -373,6 +347,11 @@ base_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
+# Configure model for gradient checkpointing
+base_model.config.use_cache = False  # Disable KV cache for gradient checkpointing
+base_model.gradient_checkpointing_enable()
+print("[INFO] Enabled gradient checkpointing and disabled KV cache for memory efficiency")
+
 # Load previous LoRA checkpoint or create fresh LoRA
 if LOAD_FROM_CHECKPOINT:
     print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
@@ -427,7 +406,7 @@ if tokenizer_for_training.padding_side == 'right':
     tokenizer_for_training.padding_side = 'left'
 
 # --- 6. Reward Function for GRPO with L2 Distance Based Scoring ---
-_num_generations_per_prompt_for_reward = 10
+_num_generations_per_prompt_for_reward = 2
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
@@ -645,7 +624,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
 print("Configuring training arguments for GRPO...")
 # Remove device-specific settings - let the system handle device allocation automatically
 use_bf16 = False  # Disable bf16 to avoid device-specific optimizations
-use_fp16 = False  # Disable fp16 to avoid device-specific optimizations
+use_fp16 = True  # Enable FP16 for memory efficiency
 
 # Setup TensorBoard logging directory
 local_tensorboard_dir = os.path.join(LOCAL_TRAINED_MODEL_PATH, "runs")
@@ -664,7 +643,7 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16, 
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE,
-    max_completion_length=500,
+    max_completion_length=8000,
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=1000,
     logging_steps=5,
@@ -675,7 +654,7 @@ training_args_grpo = GRPOConfig(
     push_to_hub=False,
     dataloader_drop_last=True,  # Changed to True to ensure consistent batches
     warmup_steps=5,  # Reduced warmup steps
-    dataloader_num_workers=0,  # Disable multiprocessing to avoid batch issues
+    # dataloader_num_workers=0,  # Disable multiprocessing to avoid batch issues
 )
 
 model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
