@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Activate virtual environment
-source ../source/bin/activate
+ source  ../myproject311/bin/activate
 
 # Install required packages
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
