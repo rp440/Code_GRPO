@@ -689,8 +689,10 @@ training_args_grpo = GRPOConfig(
     logging_dir=FINAL_TENSORBOARD_PATH,
     report_to="tensorboard",
     push_to_hub=False,
-    dataloader_drop_last=True,
+    dataloader_drop_last=True,  # CRITICAL for distributed training
     warmup_steps=5,
+    # Data loading configuration for distributed training
+    dataloader_num_workers=0,  # Avoid multiprocessing issues in distributed mode
     # Memory optimization settings
     gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
     max_grad_norm=MAX_GRAD_NORM,
@@ -705,9 +707,19 @@ model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
 print(f"Dataset validation:")
 print(f"  - Dataset size: {len(train_dataset_for_grpo)}")
 print(f"  - Dataset features: {train_dataset_for_grpo.features}")
+
 if len(train_dataset_for_grpo) == 0:
     print("[ERROR] Dataset is empty!")
     exit()
+
+# Check if dataset is sufficient for distributed training
+min_samples_needed = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS * 2
+if len(train_dataset_for_grpo) < min_samples_needed:
+    print(f"[WARNING] Dataset size ({len(train_dataset_for_grpo)}) is smaller than recommended minimum ({min_samples_needed})")
+    print(f"[WARNING] This may cause issues with distributed training across {NUM_GPUS} GPUs")
+    print(f"[RECOMMENDATION] Run dataset.py to generate more samples")
+else:
+    print(f"[SUCCESS] Dataset size is sufficient for distributed training")
 
 trainer_grpo = GRPOTrainer(
     model=model_peft,
