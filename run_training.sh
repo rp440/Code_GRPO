@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Activate virtual environment
+source ../source/bin/activate
+
+# Install required packages
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install transformers peft datasets trl tensorboard accelerate
+
+# Create necessary directories
+mkdir -p /home/ec2-user/matmul_outputs/models
+mkdir -p /home/ec2-user/matmul_outputs/tensorboard_logs
+
+# Set Hugging Face token (replace with your token)
+# export HUGGING_FACE_HUB_TOKEN="your_token_here"
+
+# Run the training script with distributed training
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --master_port=29500 \
+    GPRO_matmul_ec2.py 
