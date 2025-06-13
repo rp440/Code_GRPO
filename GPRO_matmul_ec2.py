@@ -181,13 +181,17 @@ CHECKPOINT_PATH = "/home/ec2-user/previous_checkpoint"  # Update this path
 NEW_LEARNING_RATE = 2e-5
 LOAD_FROM_CHECKPOINT = True
 
-# Training configuration for 4 Tesla T4 GPUs (15GB VRAM each)
+# Training configuration - Start with single GPU to avoid distributed issues
+# To enable multi-GPU training:
+# 1. Change NUM_GPUS to 4
+# 2. Reduce BATCH_SIZE_PER_GPU to 2 and GRAD_ACC_STEPS to 4
+# 3. Use distributed launch in run_training.sh
 EPOCHS = 1
-BATCH_SIZE_PER_GPU = 2  # Increased from 1 to 2 since T4s have 15GB VRAM
-GRAD_ACC_STEPS = 4
-NUM_GPUS = 4  # Number of Tesla T4 GPUs
+BATCH_SIZE_PER_GPU = 4  # Increased batch size since we're using single GPU
+GRAD_ACC_STEPS = 8      # Increased gradient accumulation to maintain effective batch size
+NUM_GPUS = 1            # Single GPU for stability (can be changed to 4 later)
 
-# Calculate total batch size across all GPUs
+# Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
 
 # Memory optimization settings for T4 GPUs
@@ -196,7 +200,7 @@ USE_GRADIENT_CHECKPOINTING = True
 MAX_GRAD_NORM = 1.0
 WARMUP_RATIO = 0.1
 
-model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}_gpus{NUM_GPUS}_t4"
+model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}_gpu{NUM_GPUS}_t4"
 model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
 tensorboard_name = f"runs_{model_config_desc}_{timestamp}"
 
@@ -205,8 +209,9 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
-print(f"[GPU CONFIG] Using {NUM_GPUS} Tesla T4 GPUs with {BATCH_SIZE_PER_GPU} batch size per GPU")
+print(f"[GPU CONFIG] Using {NUM_GPUS} Tesla T4 GPU with {BATCH_SIZE_PER_GPU} batch size per GPU")
 print(f"[MEMORY CONFIG] Using {TORCH_DTYPE} precision with gradient checkpointing")
+print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
   EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  I'll generate the DSL script for matrix multiplication:  
@@ -627,7 +632,7 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    max_completion_length=8000,
+    max_completion_length=16000,
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=1000,
     logging_steps=5,
@@ -638,17 +643,14 @@ training_args_grpo = GRPOConfig(
     push_to_hub=False,
     dataloader_drop_last=True,
     warmup_steps=5,
-    # Distributed training settings
-    ddp_find_unused_parameters=False,
-    ddp_backend="nccl",
-    local_rank=-1,  # Will be set by torch.distributed.launch
     # Memory optimization settings
     gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
-    # T4-specific optimizations
-    fp16_opt_level="O1",  # Mixed precision optimization level
-    fp16_backend="auto",  # Let PyTorch choose the best backend
+    # Fix for distributed training tensor issues
+    dataloader_pin_memory=False,
+    # Disable problematic distributed features
+    ddp_find_unused_parameters=False,
 )
 
 model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
@@ -677,6 +679,7 @@ print(f"  - Gradient accumulation steps: {GRAD_ACC_STEPS}")
 print(f"  - Total effective batch size: {TOTAL_BATCH_SIZE}")
 print(f"  - Learning rate: {training_args_grpo.learning_rate}")
 print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
+print(f"  - Training mode: Single GPU (CUDA_VISIBLE_DEVICES=0)")
 print(f"TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 
 trainer_grpo.train()
