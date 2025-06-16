@@ -737,7 +737,6 @@ training_args_grpo = GRPOConfig(
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
     # CRITICAL: Additional GRPO memory optimizations
-    dataloader_pin_memory=False,      # Disable pin memory to save GPU memory
     group_by_length=False,            # Disable grouping to reduce memory fragmentation
     # Apply distributed configuration
     **distributed_args,
