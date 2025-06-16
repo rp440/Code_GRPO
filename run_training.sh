@@ -57,8 +57,48 @@ except Exception as e:
 GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())")
 echo "Detected $GPU_COUNT GPUs"
 
-if [ "$GPU_COUNT" -gt 1 ]; then
-    echo "Attempting distributed training with $GPU_COUNT GPUs..."
+# **4 GPU DISTRIBUTED TRAINING SETUP**
+if [ "$GPU_COUNT" -eq 4 ]; then
+    echo "🚀 **4 GPU DISTRIBUTED TRAINING MODE**"
+    echo "   - GPUs: 4x Tesla T4 (15GB each)"
+    echo "   - Total VRAM: 60GB"
+    echo "   - Mode: Multi-GPU GRPO with Unsloth optimizations"
+    echo "   - Expected batch size: 2 per GPU (total effective: 32)"
+    
+    # Set optimal environment for 4 GPU training
+    export NCCL_DEBUG=INFO
+    export CUDA_LAUNCH_BLOCKING=0
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+    
+    # Try torchrun first (recommended for 4 GPUs)
+    echo "Launching with torchrun (recommended)..."
+    torchrun \
+        --nproc_per_node=4 \
+        --master_port=29500 \
+        --nnodes=1 \
+        --node_rank=0 \
+        GPRO_matmul_ec2.py
+    
+    # If torchrun fails, try torch.distributed.launch
+    if [ $? -ne 0 ]; then
+        echo "torchrun failed, trying torch.distributed.launch..."
+        python -m torch.distributed.launch \
+            --nproc_per_node=4 \
+            --master_port=29500 \
+            --use_env \
+            GPRO_matmul_ec2.py
+    fi
+    
+    # Final fallback to single GPU
+    if [ $? -ne 0 ]; then
+        echo "❌ Distributed training failed, falling back to single GPU..."
+        echo "   - This will be ~4x slower but will work"
+        CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
+    fi
+
+elif [ "$GPU_COUNT" -gt 1 ]; then
+    echo "🔧 **MULTI-GPU TRAINING MODE** ($GPU_COUNT GPUs)"
+    echo "   - Using all available GPUs"
     
     # Try torchrun (newer, more reliable than torch.distributed.launch)
     torchrun \
@@ -82,6 +122,13 @@ if [ "$GPU_COUNT" -gt 1 ]; then
         CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
     fi
 else
-    echo "Single GPU detected, running single GPU training..."
+    echo "💻 **SINGLE GPU TRAINING MODE**"
+    echo "   - Using GPU 0 only"
+    echo "   - Will be slower but more stable"
     CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
-fi 
+fi
+
+echo ""
+echo "🎯 **Training completed!**"
+echo "   - Check tensorboard logs for training progress"
+echo "   - Model saved to: /home/ec2-user/matmul_outputs/models/" 

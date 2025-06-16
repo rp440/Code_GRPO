@@ -239,7 +239,7 @@ if 'WORLD_SIZE' in os.environ:
         print(f"[STANDARD] Using standard training (more conservative memory usage)")
 else:
     # Single GPU training
-    NUM_GPUS = 4
+    NUM_GPUS = 1
     if UNSLOTH_AVAILABLE:
         BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
         GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
