@@ -781,7 +781,7 @@ training_args_grpo = GRPOConfig(
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # ULTRA-AGGRESSIVE MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt)
-    max_completion_length=2000,  # HEAVILY REDUCED to compensate for 2 generations
+    max_completion_length=8000,  #Do not chnage 
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=600,       # FURTHER REDUCED to save memory for 2 generations
     logging_steps=5,
