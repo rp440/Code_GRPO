@@ -34,10 +34,21 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# Unsloth imports for optimized training
-from unsloth import FastLanguageModel
-from unsloth import is_bfloat16_supported
-from unsloth.chat_templates import get_chat_template
+# Unsloth imports for optimized training (with fallback)
+try:
+    from unsloth import FastLanguageModel
+    from unsloth import is_bfloat16_supported
+    from unsloth.chat_templates import get_chat_template
+    UNSLOTH_AVAILABLE = True
+    print("[UNSLOTH] Successfully imported Unsloth optimizations")
+except ImportError as e:
+    print(f"[WARNING] Unsloth not available: {e}")
+    print("[FALLBACK] Will use standard PyTorch/transformers training")
+    UNSLOTH_AVAILABLE = False
+    
+    # Fallback functions
+    def is_bfloat16_supported():
+        return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
 
 # --- Initialize Distributed Training Environment ---
 # CRITICAL: Set memory optimization environment variables BEFORE any CUDA operations
@@ -210,21 +221,33 @@ LOAD_FROM_CHECKPOINT = True
 # Training configuration - Auto-detect distributed vs single GPU
 EPOCHS = 1
 
-# Auto-configure based on distributed environment with Unsloth optimizations
+# Auto-configure based on distributed environment and available optimizations
 if 'WORLD_SIZE' in os.environ:
-    # Multi-GPU distributed training - UNSLOTH OPTIMIZED
+    # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 2  # INCREASED thanks to Unsloth memory efficiency
-    GRAD_ACC_STEPS = 4      # REDUCED due to better memory usage
-    print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
+    if UNSLOTH_AVAILABLE:
+        BATCH_SIZE_PER_GPU = 2  # INCREASED thanks to Unsloth memory efficiency
+        GRAD_ACC_STEPS = 4      # REDUCED due to better memory usage
+        print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
+        print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
+    else:
+        BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
+        GRAD_ACC_STEPS = 8      # Higher accumulation for smaller batches
+        print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
+        print(f"[STANDARD] Using standard training (more conservative memory usage)")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
-    GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
-    print(f"[CONFIG] Single GPU mode")
-    print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
+    if UNSLOTH_AVAILABLE:
+        BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
+        GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
+        print(f"[CONFIG] Single GPU mode")
+        print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
+    else:
+        BATCH_SIZE_PER_GPU = 2  # Conservative for standard training
+        GRAD_ACC_STEPS = 16     # Higher accumulation for smaller batches
+        print(f"[CONFIG] Single GPU mode")
+        print(f"[STANDARD] Using standard training (more conservative memory usage)")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -371,60 +394,117 @@ except Exception as e:
     print("[FORMAT] Expected format: Each line should be a JSON object with matrix data.")
     exit(1)
 
-# --- 5. Model Loading and PEFT Setup with Unsloth ---
-print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
+# --- 5. Model Loading and PEFT Setup ---
+if UNSLOTH_AVAILABLE:
+    print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
+    
+    # Determine optimal dtype for the hardware
+    if is_bfloat16_supported():
+        dtype = torch.bfloat16
+        print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
+    else:
+        dtype = torch.float16
+        print("[UNSLOTH] Using float16 (fallback for older GPUs)")
 
-# Determine optimal dtype for the hardware
-if is_bfloat16_supported():
-    dtype = torch.bfloat16
-    print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
+    # Load model and tokenizer with Unsloth optimizations
+    model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
+        model_name=BASE_MODEL_NAME_FOR_FINETUNING,
+        max_seq_length=2048,  # Adjust based on your needs
+        dtype=dtype,
+        load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
+        trust_remote_code=True,
+    )
+
+    # Configure tokenizer
+    if tokenizer_for_training.pad_token is None:
+        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+    if tokenizer_for_training.padding_side == 'right':
+        tokenizer_for_training.padding_side = 'left'
+
+    # Apply chat template for better formatting
+    tokenizer_for_training = get_chat_template(
+        tokenizer_for_training,
+        chat_template="chatml",  # or "llama-3", "zephyr", etc.
+    )
+
+    # Add LoRA adapters with Unsloth optimization
+    model_peft = FastLanguageModel.get_peft_model(
+        model_peft,
+        r=16,  # LoRA rank
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
+        random_state=3407,
+        use_rslora=False,  # Set to True for rank stabilized LoRA
+        loftq_config=None,  # Set to dict for LoftQ
+    )
+    
 else:
-    dtype = torch.float16
-    print("[UNSLOTH] Using float16 (fallback for older GPUs)")
+    # Fallback to standard PyTorch/transformers approach
+    print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
+    
+    # Determine optimal dtype
+    if is_bfloat16_supported():
+        dtype = torch.bfloat16
+        print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
+    else:
+        dtype = torch.float16
+        print("[STANDARD] Using float16 (fallback for older GPUs)")
 
-# Load model and tokenizer with Unsloth optimizations
-model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-    max_seq_length=2048,  # Adjust based on your needs
-    dtype=dtype,
-    load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
-    trust_remote_code=True,
-)
+    # Configure device map for distributed vs single GPU
+    if 'RANK' in os.environ:
+        device_map = None
+        print("[DISTRIBUTED] Loading model without device_map for distributed training")
+    else:
+        device_map = "auto"
+        print("[SINGLE GPU] Loading model with device_map='auto'")
 
-# Configure tokenizer
-if tokenizer_for_training.pad_token is None:
-    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-if tokenizer_for_training.padding_side == 'right':
-    tokenizer_for_training.padding_side = 'left'
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME_FOR_FINETUNING,
+        torch_dtype=dtype,
+        device_map=device_map,
+        trust_remote_code=True
+    )
 
-# Apply chat template for better formatting
-tokenizer_for_training = get_chat_template(
-    tokenizer_for_training,
-    chat_template="chatml",  # or "llama-3", "zephyr", etc.
-)
+    # Configure model for gradient checkpointing
+    base_model.config.use_cache = False
+    print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
-# Add LoRA adapters with Unsloth optimization
-model_peft = FastLanguageModel.get_peft_model(
-    model_peft,
-    r=16,  # LoRA rank
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    lora_alpha=16,
-    lora_dropout=0.05,
-    bias="none",
-    use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-    random_state=3407,
-    use_rslora=False,  # Set to True for rank stabilized LoRA
-    loftq_config=None,  # Set to dict for LoftQ
-)
+    # Load tokenizer
+    tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
+    if tokenizer_for_training.pad_token is None:
+        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+    if tokenizer_for_training.padding_side == 'right':
+        tokenizer_for_training.padding_side = 'left'
 
-# Unsloth automatically handles gradient checkpointing optimization
-print("[UNSLOTH] Gradient checkpointing optimized automatically")
+    # Create LoRA configuration
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none"
+    )
+    model_peft = get_peft_model(base_model, lora_config)
 
-# Print trainable parameters (Unsloth method)
-FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
+# Configure gradient checkpointing and training mode
+if UNSLOTH_AVAILABLE:
+    print("[UNSLOTH] Gradient checkpointing optimized automatically")
+    FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
+else:
+    print("[STANDARD] Configuring gradient checkpointing")
+    if USE_GRADIENT_CHECKPOINTING:
+        model_peft.gradient_checkpointing_enable()
+        print("[INFO] Enabled gradient checkpointing for memory efficiency")
+    model_peft.train()
+    print("[FIX] Set model to training mode")
+
 model_peft.print_trainable_parameters()
 
 # Fresh optimizer with new learning rate and gradient clipping
