@@ -35,6 +35,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 # --- Initialize Distributed Training Environment ---
+# CRITICAL: Set memory optimization environment variables BEFORE any CUDA operations
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+print("[MEMORY] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+
 # CRITICAL: Initialize distributed environment before model loading
 if 'RANK' in os.environ:
     print(f"[DISTRIBUTED] Initializing distributed training...")
@@ -42,8 +46,14 @@ if 'RANK' in os.environ:
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     print(f"[DISTRIBUTED] Set CUDA device to: {torch.cuda.current_device()}")
+    
+    # GRPO memory optimization for distributed training
+    torch.cuda.empty_cache()
+    print(f"[MEMORY] Cleared CUDA cache for rank {os.environ.get('RANK')}")
 else:
     print("[SINGLE GPU] Running in single GPU mode")
+    torch.cuda.empty_cache()
+    print("[MEMORY] Cleared CUDA cache")
 
 # --- 1. Paths Configuration ---
 # Base directory for all outputs
@@ -197,17 +207,19 @@ EPOCHS = 1
 
 # Auto-configure based on distributed environment
 if 'WORLD_SIZE' in os.environ:
-    # Multi-GPU distributed training
+    # Multi-GPU distributed training - AGGRESSIVE MEMORY OPTIMIZATION
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 2  # Reduced for multi-GPU to fit in T4 memory
-    GRAD_ACC_STEPS = 4      # Reduced since we have more GPUs
+    BATCH_SIZE_PER_GPU = 1  # REDUCED from 2 to 1 for GRPO memory requirements
+    GRAD_ACC_STEPS = 8      # INCREASED to maintain effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
+    print(f"[MEMORY] Using aggressive memory optimization for GRPO")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4  # Increased batch size for single GPU
-    GRAD_ACC_STEPS = 8      # Increased gradient accumulation
+    BATCH_SIZE_PER_GPU = 2  # REDUCED from 4 to 2 for GRPO memory requirements
+    GRAD_ACC_STEPS = 16     # INCREASED to maintain effective batch size
     print(f"[CONFIG] Single GPU mode")
+    print(f"[MEMORY] Using aggressive memory optimization for GRPO")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -375,11 +387,9 @@ base_model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
-# Configure model for gradient checkpointing
+# CRITICAL: Configure model for gradient checkpointing BEFORE any PEFT operations
 base_model.config.use_cache = False
-if USE_GRADIENT_CHECKPOINTING:
-    base_model.gradient_checkpointing_enable()
-    print("[INFO] Enabled gradient checkpointing for memory efficiency")
+print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
 # Load previous LoRA checkpoint or create fresh LoRA
 if LOAD_FROM_CHECKPOINT:
@@ -391,12 +401,6 @@ if LOAD_FROM_CHECKPOINT:
             torch_dtype=TORCH_DTYPE  # Ensure consistent dtype
         )
         print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
-        
-        # Enable gradients for LoRA parameters
-        for name, param in model_peft.named_parameters():
-            if 'lora_' in name.lower():
-                param.requires_grad = True
-        print("[FIX] Enabled gradients for LoRA parameters")
         
     except Exception as e:
         print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
@@ -414,17 +418,50 @@ if not LOAD_FROM_CHECKPOINT:
     )
     model_peft = get_peft_model(base_model, lora_config)
 
+# CRITICAL: Configure gradient checkpointing AFTER PEFT model creation
+if USE_GRADIENT_CHECKPOINTING:
+    model_peft.gradient_checkpointing_enable()
+    print("[INFO] Enabled gradient checkpointing for memory efficiency")
+
+# CRITICAL: Ensure all model parameters have proper requires_grad setting
+trainable_params = 0
+all_params = 0
+for name, param in model_peft.named_parameters():
+    all_params += param.numel()
+    if param.requires_grad:
+        trainable_params += param.numel()
+    # Explicitly enable gradients for LoRA parameters if not already set
+    elif 'lora_' in name.lower():
+        param.requires_grad = True
+        trainable_params += param.numel()
+        print(f"[FIX] Enabled gradients for parameter: {name}")
+
+print(f"[GRADIENT CHECK] Trainable params: {trainable_params:,} / {all_params:,} ({100 * trainable_params / all_params:.2f}%)")
+
+# CRITICAL: Ensure model is in training mode
+model_peft.train()
+print("[FIX] Set model to training mode")
+
 model_peft.print_trainable_parameters()
 
 # Fresh optimizer with new learning rate and gradient clipping
 from torch.optim import AdamW
+
+# Get only trainable parameters for the optimizer
+trainable_params_for_optimizer = [param for param in model_peft.parameters() if param.requires_grad]
+print(f"[OPTIMIZER] Creating optimizer with {len(trainable_params_for_optimizer)} trainable parameter groups")
+
 optimizer = AdamW(
-    model_peft.parameters(),
+    trainable_params_for_optimizer,
     lr=NEW_LEARNING_RATE,
     weight_decay=0.01,  # Added weight decay for better regularization
     eps=1e-8  # Increased epsilon for numerical stability with FP16
 )
 print(f"[SUCCESS] Created fresh AdamW optimizer with lr={NEW_LEARNING_RATE}")
+
+# Verify optimizer has parameters with gradients
+optimizer_param_count = sum(p.numel() for group in optimizer.param_groups for p in group['params'])
+print(f"[OPTIMIZER CHECK] Optimizer managing {optimizer_param_count:,} parameters")
 
 # Reset value head parameters if it exists
 try:
@@ -444,7 +481,8 @@ if tokenizer_for_training.padding_side == 'right':
     tokenizer_for_training.padding_side = 'left'
 
 # --- 6. Reward Function for GRPO ---
-_num_generations_per_prompt_for_reward = 2
+# CRITICAL: GRPO requires multiple generations per prompt for preference learning
+_num_generations_per_prompt_for_reward = 2  # MUST be >= 2 for GRPO to work effectively
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
@@ -680,9 +718,10 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    max_completion_length=8000,  # Reduced from 16000 for memory efficiency
+    # ULTRA-AGGRESSIVE MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt)
+    max_completion_length=2000,  # HEAVILY REDUCED to compensate for 2 generations
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=1000,
+    max_prompt_length=600,       # FURTHER REDUCED to save memory for 2 generations
     logging_steps=5,
     save_strategy="steps",
     save_steps=100,
@@ -693,10 +732,13 @@ training_args_grpo = GRPOConfig(
     warmup_steps=5,
     # Data loading configuration for distributed training
     dataloader_num_workers=0,  # Avoid multiprocessing issues in distributed mode
-    # Memory optimization settings
+    # ENHANCED Memory optimization settings for GRPO
     gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
+    # CRITICAL: Additional GRPO memory optimizations
+    dataloader_pin_memory=False,      # Disable pin memory to save GPU memory
+    group_by_length=False,            # Disable grouping to reduce memory fragmentation
     # Apply distributed configuration
     **distributed_args,
 )
@@ -737,6 +779,9 @@ print(f"  - Gradient accumulation steps: {GRAD_ACC_STEPS}")
 print(f"  - Total effective batch size: {TOTAL_BATCH_SIZE}")
 print(f"  - Learning rate: {training_args_grpo.learning_rate}")
 print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
+print(f"  - Max completion length: {training_args_grpo.max_completion_length}")
+print(f"  - Max prompt length: {training_args_grpo.max_prompt_length}")
+print(f"  - Generations per prompt: {_num_generations_per_prompt_for_reward}")
 
 # Show training mode
 if 'RANK' in os.environ:
@@ -746,6 +791,17 @@ else:
     print(f"  - Training mode: Single GPU")
 
 print(f"TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
+
+# CRITICAL: Clear CUDA cache before training to maximize available memory
+torch.cuda.empty_cache()
+print("[MEMORY] Cleared CUDA cache before training")
+
+# CRITICAL: Show current GPU memory usage
+if torch.cuda.is_available():
+    current_device = torch.cuda.current_device()
+    memory_allocated = torch.cuda.memory_allocated(current_device) / 1024**3
+    memory_reserved = torch.cuda.memory_reserved(current_device) / 1024**3
+    print(f"[MEMORY] GPU {current_device}: {memory_allocated:.2f} GiB allocated, {memory_reserved:.2f} GiB reserved")
 
 trainer_grpo.train()
 print("GRPO Training finished.")
