@@ -239,7 +239,7 @@ if 'WORLD_SIZE' in os.environ:
         print(f"[STANDARD] Using standard training (more conservative memory usage)")
 else:
     # Single GPU training
-    NUM_GPUS = 1
+    NUM_GPUS = 4
     if UNSLOTH_AVAILABLE:
         BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
         GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
@@ -411,7 +411,7 @@ if UNSLOTH_AVAILABLE:
     # Load model and tokenizer with Unsloth optimizations
     model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-        max_seq_length=2048,  # Adjust based on your needs
+        max_seq_length=8000,  # Adjust based on your needs
         dtype=dtype,
         load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
         trust_remote_code=True,
