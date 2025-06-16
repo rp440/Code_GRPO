@@ -5,7 +5,7 @@
 
 # Install required packages
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install transformers peft datasets trl tensorboard accelerate
+pip install transformers peft datasets trl tensorboard accelerate unsloth
 
 # Create necessary directories
 mkdir -p /home/ec2-user/matmul_outputs/models

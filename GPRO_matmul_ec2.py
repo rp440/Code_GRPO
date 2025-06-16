@@ -34,6 +34,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
+# Unsloth imports for optimized training
+from unsloth import FastLanguageModel
+from unsloth import is_bfloat16_supported
+from unsloth.chat_templates import get_chat_template
+
 # --- Initialize Distributed Training Environment ---
 # CRITICAL: Set memory optimization environment variables BEFORE any CUDA operations
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -205,28 +210,27 @@ LOAD_FROM_CHECKPOINT = True
 # Training configuration - Auto-detect distributed vs single GPU
 EPOCHS = 1
 
-# Auto-configure based on distributed environment
+# Auto-configure based on distributed environment with Unsloth optimizations
 if 'WORLD_SIZE' in os.environ:
-    # Multi-GPU distributed training - AGGRESSIVE MEMORY OPTIMIZATION
+    # Multi-GPU distributed training - UNSLOTH OPTIMIZED
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 1  # REDUCED from 2 to 1 for GRPO memory requirements
-    GRAD_ACC_STEPS = 8      # INCREASED to maintain effective batch size
+    BATCH_SIZE_PER_GPU = 2  # INCREASED thanks to Unsloth memory efficiency
+    GRAD_ACC_STEPS = 4      # REDUCED due to better memory usage
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[MEMORY] Using aggressive memory optimization for GRPO")
+    print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 2  # REDUCED from 4 to 2 for GRPO memory requirements
-    GRAD_ACC_STEPS = 16     # INCREASED to maintain effective batch size
+    BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
+    GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
     print(f"[CONFIG] Single GPU mode")
-    print(f"[MEMORY] Using aggressive memory optimization for GRPO")
+    print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
 
-# Memory optimization settings for T4 GPUs
-TORCH_DTYPE = torch.float16  # Use FP16 for T4 GPUs
-USE_GRADIENT_CHECKPOINTING = True
+# Memory optimization settings with Unsloth (dtype handled automatically)
+USE_GRADIENT_CHECKPOINTING = True  # Unsloth handles this optimally
 MAX_GRAD_NORM = 1.0
 WARMUP_RATIO = 0.1
 
@@ -240,7 +244,7 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 print(f"[GPU CONFIG] Using {NUM_GPUS} Tesla T4 GPU with {BATCH_SIZE_PER_GPU} batch size per GPU")
-print(f"[MEMORY CONFIG] Using {TORCH_DTYPE} precision with gradient checkpointing")
+print(f"[UNSLOTH CONFIG] Using Unsloth optimized precision with gradient checkpointing")
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
@@ -367,81 +371,60 @@ except Exception as e:
     print("[FORMAT] Expected format: Each line should be a JSON object with matrix data.")
     exit(1)
 
-# --- 5. Model Loading and PEFT Setup ---
-print(f"Loading base model: {BASE_MODEL_NAME_FOR_FINETUNING}")
+# --- 5. Model Loading and PEFT Setup with Unsloth ---
+print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
 
-# Configure device map for distributed vs single GPU
-if 'RANK' in os.environ:
-    # Distributed training - don't use device_map="auto"
-    device_map = None
-    print("[DISTRIBUTED] Loading model without device_map for distributed training")
+# Determine optimal dtype for the hardware
+if is_bfloat16_supported():
+    dtype = torch.bfloat16
+    print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
 else:
-    # Single GPU - use device_map="auto"
-    device_map = "auto"
-    print("[SINGLE GPU] Loading model with device_map='auto'")
+    dtype = torch.float16
+    print("[UNSLOTH] Using float16 (fallback for older GPUs)")
 
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_NAME_FOR_FINETUNING,
-    torch_dtype=TORCH_DTYPE,  # Use FP16 for T4 GPUs
-    device_map=device_map,
-    trust_remote_code=True
+# Load model and tokenizer with Unsloth optimizations
+model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
+    model_name=BASE_MODEL_NAME_FOR_FINETUNING,
+    max_seq_length=2048,  # Adjust based on your needs
+    dtype=dtype,
+    load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
+    trust_remote_code=True,
 )
 
-# CRITICAL: Configure model for gradient checkpointing BEFORE any PEFT operations
-base_model.config.use_cache = False
-print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
+# Configure tokenizer
+if tokenizer_for_training.pad_token is None:
+    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+if tokenizer_for_training.padding_side == 'right':
+    tokenizer_for_training.padding_side = 'left'
 
-# Load previous LoRA checkpoint or create fresh LoRA
-if LOAD_FROM_CHECKPOINT:
-    print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
-    try:
-        model_peft = PeftModel.from_pretrained(
-            base_model, 
-            CHECKPOINT_PATH,
-            torch_dtype=TORCH_DTYPE  # Ensure consistent dtype
-        )
-        print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
-        
-    except Exception as e:
-        print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
-        LOAD_FROM_CHECKPOINT = False
+# Apply chat template for better formatting
+tokenizer_for_training = get_chat_template(
+    tokenizer_for_training,
+    chat_template="chatml",  # or "llama-3", "zephyr", etc.
+)
 
-if not LOAD_FROM_CHECKPOINT:
-    print("Creating fresh LoRA configuration...")
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        bias="none"
-    )
-    model_peft = get_peft_model(base_model, lora_config)
+# Add LoRA adapters with Unsloth optimization
+model_peft = FastLanguageModel.get_peft_model(
+    model_peft,
+    r=16,  # LoRA rank
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
+    random_state=3407,
+    use_rslora=False,  # Set to True for rank stabilized LoRA
+    loftq_config=None,  # Set to dict for LoftQ
+)
 
-# CRITICAL: Configure gradient checkpointing AFTER PEFT model creation
-if USE_GRADIENT_CHECKPOINTING:
-    model_peft.gradient_checkpointing_enable()
-    print("[INFO] Enabled gradient checkpointing for memory efficiency")
+# Unsloth automatically handles gradient checkpointing optimization
+print("[UNSLOTH] Gradient checkpointing optimized automatically")
 
-# CRITICAL: Ensure all model parameters have proper requires_grad setting
-trainable_params = 0
-all_params = 0
-for name, param in model_peft.named_parameters():
-    all_params += param.numel()
-    if param.requires_grad:
-        trainable_params += param.numel()
-    # Explicitly enable gradients for LoRA parameters if not already set
-    elif 'lora_' in name.lower():
-        param.requires_grad = True
-        trainable_params += param.numel()
-        print(f"[FIX] Enabled gradients for parameter: {name}")
-
-print(f"[GRADIENT CHECK] Trainable params: {trainable_params:,} / {all_params:,} ({100 * trainable_params / all_params:.2f}%)")
-
-# CRITICAL: Ensure model is in training mode
-model_peft.train()
-print("[FIX] Set model to training mode")
-
+# Print trainable parameters (Unsloth method)
+FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
 model_peft.print_trainable_parameters()
 
 # Fresh optimizer with new learning rate and gradient clipping
@@ -473,12 +456,8 @@ try:
 except Exception as e:
     print(f"[WARNING] Could not reset value head: {e}")
 
-tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-if tokenizer_for_training.pad_token is None:
-    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    model_peft.config.pad_token_id = tokenizer_for_training.eos_token_id
-if tokenizer_for_training.padding_side == 'right':
-    tokenizer_for_training.padding_side = 'left'
+# Tokenizer already configured by Unsloth above
+model_peft.config.pad_token_id = tokenizer_for_training.eos_token_id
 
 # --- 6. Reward Function for GRPO ---
 # CRITICAL: GRPO requires multiple generations per prompt for preference learning
@@ -686,9 +665,10 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     return rewards
 
 # --- 7. Training Arguments and GRPOTrainer ---
-print("Configuring training arguments for GRPO...")
-use_bf16 = False  # T4s don't support bfloat16
-use_fp16 = True   # Use FP16 for T4 GPUs
+print("Configuring training arguments for GRPO with Unsloth...")
+# Unsloth automatically handles optimal precision settings
+use_bf16 = is_bfloat16_supported()  # Automatic detection
+use_fp16 = not use_bf16
 
 # Configure distributed training arguments
 distributed_args = {}
