@@ -1,4 +1,12 @@
 #!/bin/bash
+sudo apt update
+sudo apt install software-properties-common -y
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install python3.11 python3.11-venv python3.11-dev python3.11-distutils -y
+
+python3.11 -m venv myproject311
+
 
 # Activate virtual environment
 source ../myproject311/bin/activate
