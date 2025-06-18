@@ -420,14 +420,34 @@ if UNSLOTH_AVAILABLE:
         )
         
         # CRITICAL FIX: Set max_seq_length on ALL model components for Unsloth compatibility
+        # Set on main PEFT model
         model_peft.max_seq_length = 8000
+        
+        # Set on base model components (where Unsloth actually looks)
         if hasattr(model_peft, 'model'):
             model_peft.model.max_seq_length = 8000
         if hasattr(model_peft, 'base_model'):
             model_peft.base_model.max_seq_length = 8000
+            # This is the critical one - the actual Qwen2ForCausalLM model
             if hasattr(model_peft.base_model, 'model'):
                 model_peft.base_model.model.max_seq_length = 8000
-        print("[FIX] Set max_seq_length=8000 on all model components for Unsloth compatibility")
+        
+        # DEEP FIX: Find and set on the actual Qwen2ForCausalLM object
+        def set_max_seq_length_recursive(obj, value=8000):
+            """Recursively set max_seq_length on all model objects"""
+            if hasattr(obj, '__class__') and 'Qwen2' in str(obj.__class__):
+                obj.max_seq_length = value
+                print(f"[FIX] Set max_seq_length={value} on {obj.__class__.__name__}")
+            
+            # Check common PEFT/model attributes
+            for attr_name in ['model', 'base_model', 'transformer', 'lm_head']:
+                if hasattr(obj, attr_name):
+                    attr_obj = getattr(obj, attr_name)
+                    if attr_obj is not None and attr_obj != obj:  # Avoid infinite recursion
+                        set_max_seq_length_recursive(attr_obj, value)
+        
+        set_max_seq_length_recursive(model_peft)
+        print("[FIX] Applied max_seq_length=8000 recursively to all model components")
         
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
