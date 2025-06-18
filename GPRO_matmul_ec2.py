@@ -195,7 +195,7 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
@@ -213,14 +213,14 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 20  # Increased for better memory utilization
+    BATCH_SIZE_PER_GPU = 10  # Increased for better memory utilization
     GRAD_ACC_STEPS = 2       # Reduced since batch size increased
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 20  # Increased for better memory utilization
+    BATCH_SIZE_PER_GPU = 10  # Increased for better memory utilization
     GRAD_ACC_STEPS = 2       # Reduced since batch size increased
     print(f"[CONFIG] Single GPU mode")
     print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
@@ -463,7 +463,7 @@ model_peft.config.pad_token_id = tokenizer_for_training.eos_token_id
 
 # --- 6. Reward Function for GRPO ---
 # CRITICAL: GRPO requires multiple generations per prompt for preference learning
-_num_generations_per_prompt_for_reward = 2  # MUST be >= 2 for GRPO to work effectively
+_num_generations_per_prompt_for_reward = 4  # MUST be >= 2 for GRPO to work effectively
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
