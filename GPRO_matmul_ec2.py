@@ -417,6 +417,7 @@ if UNSLOTH_AVAILABLE:
             dtype=dtype,
             load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
             trust_remote_code=True,
+            device_map="cuda",  # CRITICAL FIX: Ensure model is on GPU
         )
         
         # CRITICAL FIX: Set max_seq_length on ALL model components for Unsloth compatibility
@@ -449,6 +450,12 @@ if UNSLOTH_AVAILABLE:
         set_max_seq_length_recursive(model_peft)
         print("[FIX] Applied max_seq_length=8000 recursively to all model components")
         
+        # CRITICAL FIX: Ensure model and tokenizer are on same device
+        print(f"[DEVICE CHECK] Model device: {next(model_peft.parameters()).device}")
+        if torch.cuda.is_available():
+            model_peft = model_peft.cuda()
+            print("[FIX] Moved model to CUDA")
+        
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
         
@@ -464,6 +471,11 @@ if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_lo
         tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
     if tokenizer_for_training.padding_side == 'right':
         tokenizer_for_training.padding_side = 'left'
+
+    # DEVICE FIX: Ensure tokenizer uses consistent padding token ID
+    if hasattr(tokenizer_for_training, 'pad_token_id') and tokenizer_for_training.pad_token_id is None:
+        tokenizer_for_training.pad_token_id = tokenizer_for_training.eos_token_id
+        print("[FIX] Set tokenizer pad_token_id for device compatibility")
 
     # Apply chat template for better formatting
     tokenizer_for_training = get_chat_template(
