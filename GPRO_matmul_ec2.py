@@ -44,6 +44,7 @@ try:
 except ImportError as e:
     print(f"[WARNING] Unsloth not available: {e}")
     print("[FALLBACK] Will use standard PyTorch/transformers training")
+    print("[TIP] To install Unsloth: pip install 'unsloth[conda] @ git+https://github.com/unslothai/unsloth.git'")
     UNSLOTH_AVAILABLE = False
     
     # Fallback functions
@@ -209,7 +210,7 @@ C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_I
 
 # --- 3. GRPO Configuration and System Prompt ---
 # BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2-7B-Instruct"
+BASE_MODEL_NAME_FOR_FINETUNING = "unsloth/DeepSeek-R1-Distill-Qwen-14B-GGUF"
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
@@ -229,27 +230,27 @@ if 'WORLD_SIZE' in os.environ:
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
     if UNSLOTH_AVAILABLE:
         BATCH_SIZE_PER_GPU = 2  # INCREASED thanks to Unsloth memory efficiency
-        GRAD_ACC_STEPS = 4      # REDUCED due to better memory usage
+        GRAD_ACC_STEPS = 4      # Optimized for 15GB Tesla T4 memory limit
         print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
         print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
     else:
         BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
-        GRAD_ACC_STEPS = 8      # Higher accumulation for smaller batches
+        GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
         print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-        print(f"[STANDARD] Using standard training (more conservative memory usage)")
+        print(f"[STANDARD] Using standard training (memory optimized for 15GB GPUs)")
 else:
     # Single GPU training
     NUM_GPUS = 1
     if UNSLOTH_AVAILABLE:
-        BATCH_SIZE_PER_GPU = 4  # INCREASED thanks to Unsloth memory efficiency
-        GRAD_ACC_STEPS = 8      # REDUCED due to better memory usage
+        BATCH_SIZE_PER_GPU = 2  # REDUCED to fit 15GB Tesla T4 memory limit
+        GRAD_ACC_STEPS = 4      # Optimized for 15GB Tesla T4 memory limit
         print(f"[CONFIG] Single GPU mode")
-        print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
+        print(f"[UNSLOTH] Using Unsloth optimizations (memory optimized for 15GB GPU)")
     else:
-        BATCH_SIZE_PER_GPU = 2  # Conservative for standard training
-        GRAD_ACC_STEPS = 16     # Higher accumulation for smaller batches
+        BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
+        GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
         print(f"[CONFIG] Single GPU mode")
-        print(f"[STANDARD] Using standard training (more conservative memory usage)")
+        print(f"[STANDARD] Using standard training (memory optimized for 15GB GPU)")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -274,21 +275,21 @@ print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
   EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  I'll generate the DSL script for matrix multiplication:  
-<DSL> M1 = A[0,0] * B[0,0] M2 = A[0,1] * B[1,0] S1 = M1 + M2 C[0,0] = S1
-M3 = A[0,0] * B[0,1]
-M4 = A[0,1] * B[1,1]
-S2 = M3 + M4
-C[0,1] = S2
+<DSL>
+M1 = (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
+M2 = (A[1,0] + A[0,1]) * (B[0,1])
+M3 = A[1,1] * (B[0,0] - B[1,1])
+M4 = A[0,0] * (B[1,1] + B[0,0])
+M5 = (A[0,1] + A[1,1]) * (B[0,0])
+M6 = (A[1,0] - A[0,0]) * (B[1,0] - B[0,1])
+M7 = (A[0,0] + A[1,0]) * (B[0,1] - B[1,1])
 
-M5 = A[1,0] * B[0,0]
-M6 = A[1,1] * B[1,0]
-S3 = M5 + M6
-C[1,0] = S3
+C[0,0] = M2 + M3 - M5 + M6
+C[0,1] = M1 + M6 - M4
+C[1,0] = M7 - M2 + M1
+C[1,1] = M3 - M4 + M5 - M7
+</DSL>
 
-M7 = A[1,1] * B[1,1]
-S4 = M7 - M6
-C[1,1] = S4
-</DSL>  
 This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.  YOUR TASK: Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags. 
 DSL SYNTAX RULES: - M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0]) - S variables:
  Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
@@ -398,55 +399,64 @@ except Exception as e:
 
 # --- 5. Model Loading and PEFT Setup ---
 if UNSLOTH_AVAILABLE:
-    print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
+    print(f"Attempting to load base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
     
-    # Determine optimal dtype for the hardware
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[UNSLOTH] Using float16 (fallback for older GPUs)")
+    try:
+        # Determine optimal dtype for the hardware
+        if is_bfloat16_supported():
+            dtype = torch.bfloat16
+            print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
+        else:
+            dtype = torch.float16
+            print("[UNSLOTH] Using float16 (fallback for older GPUs)")
 
-    # Load model and tokenizer with Unsloth optimizations
-    model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-        max_seq_length=8000,  # Adjust based on your needs
-        dtype=dtype,
-        load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
-        trust_remote_code=True,
-    )
+        # Load model and tokenizer with Unsloth optimizations
+        model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
+            model_name=BASE_MODEL_NAME_FOR_FINETUNING,
+            max_seq_length=8000,  # Adjust based on your needs
+            dtype=dtype,
+            load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
+            trust_remote_code=True,
+        )
+        print("[SUCCESS] Unsloth model loaded successfully!")
+        unsloth_model_loaded = True
+        
+    except Exception as e:
+        print(f"[ERROR] Unsloth loading failed: {e}")
+        print("[FALLBACK] Switching to standard PyTorch/transformers approach...")
+        UNSLOTH_AVAILABLE = False
+        unsloth_model_loaded = False
 
-    # Configure tokenizer
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
+        # Configure tokenizer only if Unsloth succeeded
+        if tokenizer_for_training.pad_token is None:
+            tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+        if tokenizer_for_training.padding_side == 'right':
+            tokenizer_for_training.padding_side = 'left'
 
-    # Apply chat template for better formatting
-    tokenizer_for_training = get_chat_template(
-        tokenizer_for_training,
-        chat_template="chatml",  # or "llama-3", "zephyr", etc.
-    )
+        # Apply chat template for better formatting
+        tokenizer_for_training = get_chat_template(
+            tokenizer_for_training,
+            chat_template="chatml",  # or "llama-3", "zephyr", etc.
+        )
 
-    # Add LoRA adapters with Unsloth optimization
-    model_peft = FastLanguageModel.get_peft_model(
-        model_peft,
-        r=16,  # LoRA rank
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-        random_state=3407,
-        use_rslora=False,  # Set to True for rank stabilized LoRA
-        loftq_config=None,  # Set to dict for LoftQ
-    )
-    
-else:
+        # Add LoRA adapters with Unsloth optimization
+        model_peft = FastLanguageModel.get_peft_model(
+            model_peft,
+            r=16,  # LoRA rank
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=16,
+            lora_dropout=0.05,
+            bias="none",
+            use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
+            random_state=3407,
+            use_rslora=False,  # Set to True for rank stabilized LoRA
+            loftq_config=None,  # Set to dict for LoftQ
+        )
+# Use standard approach if Unsloth is not available or failed to load
+if not UNSLOTH_AVAILABLE:
     # Fallback to standard PyTorch/transformers approach
     print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
     
@@ -496,7 +506,7 @@ else:
     model_peft = get_peft_model(base_model, lora_config)
 
 # Configure gradient checkpointing and training mode
-if UNSLOTH_AVAILABLE:
+if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_loaded:
     print("[UNSLOTH] Gradient checkpointing optimized automatically")
     FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
 else:

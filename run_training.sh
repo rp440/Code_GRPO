@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Activate virtual environment
-source ../myproject311/bin/activate
+# source ../myproject311/bin/activate
 
 # Update pip and install wheel
 pip install --upgrade pip wheel
