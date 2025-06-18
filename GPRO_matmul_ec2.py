@@ -410,51 +410,14 @@ if UNSLOTH_AVAILABLE:
             dtype = torch.float16
             print("[UNSLOTH] Using float16 (fallback for older GPUs)")
 
-                # Load model and tokenizer with Unsloth optimizations
+                # Load model and tokenizer with Unsloth optimizations (using working Colab pattern)
         model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
             model_name=BASE_MODEL_NAME_FOR_FINETUNING,
             max_seq_length=8000,  # Keep your desired 8K max length
             dtype=dtype,
             load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
             trust_remote_code=True,
-            device_map="cuda",  # CRITICAL FIX: Ensure model is on GPU
         )
-        
-        # CRITICAL FIX: Set max_seq_length on ALL model components for Unsloth compatibility
-        # Set on main PEFT model
-        model_peft.max_seq_length = 8000
-        
-        # Set on base model components (where Unsloth actually looks)
-        if hasattr(model_peft, 'model'):
-            model_peft.model.max_seq_length = 8000
-        if hasattr(model_peft, 'base_model'):
-            model_peft.base_model.max_seq_length = 8000
-            # This is the critical one - the actual Qwen2ForCausalLM model
-            if hasattr(model_peft.base_model, 'model'):
-                model_peft.base_model.model.max_seq_length = 8000
-        
-        # DEEP FIX: Find and set on the actual Qwen2ForCausalLM object
-        def set_max_seq_length_recursive(obj, value=8000):
-            """Recursively set max_seq_length on all model objects"""
-            if hasattr(obj, '__class__') and 'Qwen2' in str(obj.__class__):
-                obj.max_seq_length = value
-                print(f"[FIX] Set max_seq_length={value} on {obj.__class__.__name__}")
-            
-            # Check common PEFT/model attributes
-            for attr_name in ['model', 'base_model', 'transformer', 'lm_head']:
-                if hasattr(obj, attr_name):
-                    attr_obj = getattr(obj, attr_name)
-                    if attr_obj is not None and attr_obj != obj:  # Avoid infinite recursion
-                        set_max_seq_length_recursive(attr_obj, value)
-        
-        set_max_seq_length_recursive(model_peft)
-        print("[FIX] Applied max_seq_length=8000 recursively to all model components")
-        
-        # CRITICAL FIX: Ensure model and tokenizer are on same device
-        print(f"[DEVICE CHECK] Model device: {next(model_peft.parameters()).device}")
-        if torch.cuda.is_available():
-            model_peft = model_peft.cuda()
-            print("[FIX] Moved model to CUDA")
         
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
@@ -472,10 +435,7 @@ if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_lo
     if tokenizer_for_training.padding_side == 'right':
         tokenizer_for_training.padding_side = 'left'
 
-    # DEVICE FIX: Ensure tokenizer uses consistent padding token ID
-    if hasattr(tokenizer_for_training, 'pad_token_id') and tokenizer_for_training.pad_token_id is None:
-        tokenizer_for_training.pad_token_id = tokenizer_for_training.eos_token_id
-        print("[FIX] Set tokenizer pad_token_id for device compatibility")
+    # Configure tokenizer
 
     # Apply chat template for better formatting
     tokenizer_for_training = get_chat_template(
@@ -882,6 +842,7 @@ else:
 
 trainer_grpo = GRPOTrainer(
     model=model_peft,
+    processing_class=tokenizer_for_training,  # CRITICAL FIX: Use processing_class parameter (from reference)
     reward_funcs=[matrix_dsl_reward],
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,
