@@ -418,6 +418,11 @@ if UNSLOTH_AVAILABLE:
             load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
             trust_remote_code=True,
         )
+
+        if not hasattr(model_peft, 'max_seq_length'):
+            model_peft.max_seq_length = 8000
+            print("[FIX] Set max_seq_length attribute for Unsloth compatibility")
+        
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
         
