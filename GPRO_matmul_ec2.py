@@ -419,13 +419,15 @@ if UNSLOTH_AVAILABLE:
             trust_remote_code=True,
         )
         
-        # CRITICAL FIX: Ensure max_seq_length attribute exists for Unsloth compatibility
-        if not hasattr(model_peft, 'max_seq_length'):
-            model_peft.max_seq_length = 8000
-            print("[FIX] Set max_seq_length=8000 attribute for Unsloth compatibility")
-        elif model_peft.max_seq_length != 8000:
-            model_peft.max_seq_length = 8000
-            print("[FIX] Updated max_seq_length to 8000 for consistency")
+        # CRITICAL FIX: Set max_seq_length on ALL model components for Unsloth compatibility
+        model_peft.max_seq_length = 8000
+        if hasattr(model_peft, 'model'):
+            model_peft.model.max_seq_length = 8000
+        if hasattr(model_peft, 'base_model'):
+            model_peft.base_model.max_seq_length = 8000
+            if hasattr(model_peft.base_model, 'model'):
+                model_peft.base_model.model.max_seq_length = 8000
+        print("[FIX] Set max_seq_length=8000 on all model components for Unsloth compatibility")
         
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
