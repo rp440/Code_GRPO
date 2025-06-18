@@ -213,17 +213,17 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 10  # Increased for better memory utilization
-    GRAD_ACC_STEPS = 2       # Reduced since batch size increased
+    BATCH_SIZE_PER_GPU = 32  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
+    print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 10  # Increased for better memory utilization
-    GRAD_ACC_STEPS = 2       # Reduced since batch size increased
+    BATCH_SIZE_PER_GPU = 32  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps  
     print(f"[CONFIG] Single GPU mode")
-    print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
+    print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -507,9 +507,51 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     expected_C_str_list = kwargs["expected_C_str"]
     rewards = []
 
-    print(f"\n=== NEW REWARD CALCULATION CALL #{_reward_call_count} ===")
+    print(f"\n{'='*80}")
+    print(f"LIVE GENERATION STREAM - BATCH #{_reward_call_count}")
+    print(f"{'='*80}")
     print(f"Processing {len(completions)} completions...")
     print(f"Current best multiplications: {_best_n_mults if _best_n_mults != float('inf') else 'None found yet'}")
+    print(f"{'='*80}")
+    
+    # Stream current generations for monitoring
+    print(f"\nSTREAMING CURRENT GENERATIONS:")
+    print(f"{'-'*60}")
+    
+    for stream_idx, raw_completion in enumerate(completions[:min(4, len(completions))]):  # Show first 4 generations
+        prompt_idx = stream_idx // _num_generations_per_prompt_for_reward
+        
+        # Extract readable content for streaming
+        if isinstance(raw_completion, list):
+            if len(raw_completion) == 1:
+                item = raw_completion[0]
+                if isinstance(item, dict) and 'content' in item:
+                    stream_content = item['content']
+                else:
+                    stream_content = str(item)
+            else:
+                stream_content = str(raw_completion)
+        elif isinstance(raw_completion, dict) and 'content' in raw_completion:
+            stream_content = raw_completion['content']
+        elif isinstance(raw_completion, str):
+            stream_content = raw_completion
+        else:
+            stream_content = str(raw_completion)
+        
+        # Clean up special tokens for display
+        display_content = stream_content
+        temp_tokens = ["<|im_end|>", "<|endoftext|>", "<|file_separator|>"]
+        for token in temp_tokens:
+            display_content = display_content.replace(token, "")
+        
+        # Truncate for readability
+        truncated_content = display_content[:300] + "..." if len(display_content) > 300 else display_content
+        
+        print(f"Gen {stream_idx+1} (Prompt {prompt_idx+1}): {truncated_content.strip()}")
+        print(f"{'-'*30}")
+    
+    print(f"PROCESSING AND SCORING...")
+    print(f"{'='*80}")
 
     for i, dsl_script_raw_content in enumerate(completions):
         prompt_idx = i // _num_generations_per_prompt_for_reward
@@ -661,9 +703,58 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
         else:
             print(f"  Completion {i}: Final reward: {final_reward:.1f}")
         
-    print(f"Batch average reward: {sum(rewards)/len(rewards):.2f}")
-    print(f"Current global best: {_best_n_mults if _best_n_mults != float('inf') else 'None'} multiplications")
-    print("=" * 50)
+    # Batch summary and cleanup for next iteration
+    avg_reward = sum(rewards) / len(rewards)
+    max_reward = max(rewards)
+    min_reward = min(rewards)
+    
+    print(f"\nBATCH #{_reward_call_count} SUMMARY:")
+    print(f"{'='*80}")
+    print(f"Rewards: Avg={avg_reward:.2f}, Max={max_reward:.2f}, Min={min_reward:.2f}")
+    print(f"Global best: {_best_n_mults if _best_n_mults != float('inf') else 'None'} multiplications")
+    
+    # Show reward distribution
+    excellent_count = sum(1 for r in rewards if r >= 5.0)
+    good_count = sum(1 for r in rewards if 0.0 <= r < 5.0)
+    bad_count = sum(1 for r in rewards if r < 0.0)
+    
+    print(f"Distribution: {excellent_count} excellent (>=5.0), {good_count} good (0-5), {bad_count} poor (<0)")
+    
+    # Show top 2 completions for learning insight
+    reward_completion_pairs = list(zip(rewards, completions))
+    reward_completion_pairs.sort(key=lambda x: x[0], reverse=True)
+    
+    print(f"\nTOP 2 GENERATIONS THIS BATCH:")
+    for rank, (top_reward, top_completion) in enumerate(reward_completion_pairs[:2]):
+        # Extract content for display
+        if isinstance(top_completion, list) and len(top_completion) == 1:
+            if isinstance(top_completion[0], dict) and 'content' in top_completion[0]:
+                display_content = top_completion[0]['content']
+            else:
+                display_content = str(top_completion[0])
+        elif isinstance(top_completion, dict) and 'content' in top_completion:
+            display_content = top_completion['content']
+        else:
+            display_content = str(top_completion)
+        
+        # Clean and truncate
+        for token in ["<|im_end|>", "<|endoftext|>", "<|file_separator|>"]:
+            display_content = display_content.replace(token, "")
+        
+        # Extract DSL if present
+        dsl_match = re.search(r'<DSL>(.*?)</DSL>', display_content, re.DOTALL | re.IGNORECASE)
+        if dsl_match:
+            dsl_preview = dsl_match.group(1).strip()[:150] + "..." if len(dsl_match.group(1).strip()) > 150 else dsl_match.group(1).strip()
+            print(f"#{rank+1} (Score: {top_reward:.2f}): {dsl_preview}")
+        else:
+            preview = display_content.strip()[:150] + "..." if len(display_content.strip()) > 150 else display_content.strip()
+            print(f"#{rank+1} (Score: {top_reward:.2f}): {preview}")
+    
+    print(f"\nCLEARING BATCH DATA FOR NEXT ITERATION...")
+    print(f"{'='*80}")
+    print(f"Processed {len(completions)} generations -> returning {len(rewards)} rewards")
+    print(f"Ready for next batch...\n")
+    
     return rewards
 
 # --- 7. Training Arguments and GRPOTrainer ---
@@ -701,7 +792,7 @@ training_args_grpo = GRPOConfig(
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 16k context length
-    max_completion_length=16000,  # 16k context length for better performance
+    max_completion_length=8000,  # 16k context length for better performance
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=1200,       # Increased proportionally with completion length
     logging_steps=5,
