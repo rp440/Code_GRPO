@@ -34,22 +34,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# Unsloth imports for optimized training (with fallback)
-try:
-    from unsloth import FastLanguageModel
-    from unsloth import is_bfloat16_supported
-    from unsloth.chat_templates import get_chat_template
-    UNSLOTH_AVAILABLE = True
-    print("[UNSLOTH] Successfully imported Unsloth optimizations")
-except ImportError as e:
-    print(f"[WARNING] Unsloth not available: {e}")
-    print("[FALLBACK] Will use standard PyTorch/transformers training")
-    print("[TIP] To install Unsloth: pip install 'unsloth[conda] @ git+https://github.com/unslothai/unsloth.git'")
-    UNSLOTH_AVAILABLE = False
-    
-    # Fallback functions
-    def is_bfloat16_supported():
-        return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+def is_bfloat16_supported():
+    return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
 
 # --- Initialize Distributed Training Environment ---
 # CRITICAL: Set memory optimization environment variables BEFORE any CUDA operations
@@ -209,8 +195,7 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-# BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
@@ -224,39 +209,27 @@ LOAD_FROM_CHECKPOINT = True
 # Training configuration - Auto-detect distributed vs single GPU
 EPOCHS = 1
 
-# Auto-configure based on distributed environment and available optimizations
+# Auto-configure based on distributed environment
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    if UNSLOTH_AVAILABLE:
-        BATCH_SIZE_PER_GPU = 2  # INCREASED thanks to Unsloth memory efficiency
-        GRAD_ACC_STEPS = 4      # Optimized for 15GB Tesla T4 memory limit
-        print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-        print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
-    else:
-        BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
-        GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
-        print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-        print(f"[STANDARD] Using standard training (memory optimized for 15GB GPUs)")
+    BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
+    GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
+    print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
+    print(f"[STANDARD] Using standard training (memory optimized for 15GB GPUs)")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    if UNSLOTH_AVAILABLE:
-        BATCH_SIZE_PER_GPU = 2  # REDUCED to fit 15GB Tesla T4 memory limit
-        GRAD_ACC_STEPS = 4      # Optimized for 15GB Tesla T4 memory limit
-        print(f"[CONFIG] Single GPU mode")
-        print(f"[UNSLOTH] Using Unsloth optimizations (memory optimized for 15GB GPU)")
-    else:
-        BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
-        GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
-        print(f"[CONFIG] Single GPU mode")
-        print(f"[STANDARD] Using standard training (memory optimized for 15GB GPU)")
+    BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
+    GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
+    print(f"[CONFIG] Single GPU mode")
+    print(f"[STANDARD] Using standard training (memory optimized for 15GB GPU)")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
 
-# Memory optimization settings with Unsloth (dtype handled automatically)
-USE_GRADIENT_CHECKPOINTING = True  # Unsloth handles this optimally
+# Memory optimization settings
+USE_GRADIENT_CHECKPOINTING = True
 MAX_GRAD_NORM = 1.0
 WARMUP_RATIO = 0.1
 
@@ -270,7 +243,7 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 print(f"[GPU CONFIG] Using {NUM_GPUS} Tesla T4 GPU with {BATCH_SIZE_PER_GPU} batch size per GPU")
-print(f"[UNSLOTH CONFIG] Using Unsloth optimized precision with gradient checkpointing")
+print(f"[TRAINING CONFIG] Context length: 8000 tokens")
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
@@ -398,130 +371,61 @@ except Exception as e:
     exit(1)
 
 # --- 5. Model Loading and PEFT Setup ---
-if UNSLOTH_AVAILABLE:
-    print(f"Attempting to load base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    try:
-        # Determine optimal dtype for the hardware
-        if is_bfloat16_supported():
-            dtype = torch.bfloat16
-            print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
-        else:
-            dtype = torch.float16
-            print("[UNSLOTH] Using float16 (fallback for older GPUs)")
+# Load model and tokenizer with standard PyTorch/transformers approach
+print(f"Loading base model: {BASE_MODEL_NAME_FOR_FINETUNING}")
 
-                # Load model and tokenizer with Unsloth optimizations (using working Colab pattern)
-        model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
-            model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-            max_seq_length=8000,  # Keep your desired 8K max length
-            dtype=dtype,
-            load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
-            trust_remote_code=True,
-        )
-        
-        print("[SUCCESS] Unsloth model loaded successfully!")
-        unsloth_model_loaded = True
-        
-    except Exception as e:
-        print(f"[ERROR] Unsloth loading failed: {e}")
-        print("[FALLBACK] Switching to standard PyTorch/transformers approach...")
-        UNSLOTH_AVAILABLE = False
-        unsloth_model_loaded = False
+# Determine optimal dtype
+if is_bfloat16_supported():
+    dtype = torch.bfloat16
+    print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
+else:
+    dtype = torch.float16
+    print("[STANDARD] Using float16 (fallback for older GPUs)")
 
-# Only configure tokenizer if Unsloth succeeded
-if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_loaded:
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
+# Configure device map for distributed vs single GPU
+if 'RANK' in os.environ:
+    device_map = None
+    print("[DISTRIBUTED] Loading model without device_map for distributed training")
+else:
+    device_map = "auto"
+    print("[SINGLE GPU] Loading model with device_map='auto'")
 
-    # Configure tokenizer
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME_FOR_FINETUNING,
+    torch_dtype=dtype,
+    device_map=device_map,
+    trust_remote_code=True
+)
 
-    # Apply chat template for better formatting
-    tokenizer_for_training = get_chat_template(
-        tokenizer_for_training,
-        chat_template="chatml",  # or "llama-3", "zephyr", etc.
-    )
+# Configure model for gradient checkpointing
+base_model.config.use_cache = False
+print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
-    # Add LoRA adapters with Unsloth optimization
-    model_peft = FastLanguageModel.get_peft_model(
-        model_peft,
-        r=16,  # LoRA rank
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-        random_state=3407,
-        use_rslora=False,  # Set to True for rank stabilized LoRA
-        loftq_config=None,  # Set to dict for LoftQ
-    )
+# Load tokenizer
+tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
+if tokenizer_for_training.pad_token is None:
+    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+if tokenizer_for_training.padding_side == 'right':
+    tokenizer_for_training.padding_side = 'left'
 
-
-# Use standard approach if Unsloth is not available or failed to load
-if not UNSLOTH_AVAILABLE:
-    # Fallback to standard PyTorch/transformers approach
-    print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    # Determine optimal dtype
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[STANDARD] Using float16 (fallback for older GPUs)")
-
-    # Configure device map for distributed vs single GPU
-    if 'RANK' in os.environ:
-        device_map = None
-        print("[DISTRIBUTED] Loading model without device_map for distributed training")
-    else:
-        device_map = "auto"
-        print("[SINGLE GPU] Loading model with device_map='auto'")
-
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING,
-        torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True
-    )
-
-    # Configure model for gradient checkpointing
-    base_model.config.use_cache = False
-    print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
-
-    # Load tokenizer
-    tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
-
-    # Create LoRA configuration
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        bias="none"
-    )
-    model_peft = get_peft_model(base_model, lora_config)
+# Create LoRA configuration for Qwen2.5
+lora_config = LoraConfig(
+    task_type="CAUSAL_LM",
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    bias="none"
+)
+model_peft = get_peft_model(base_model, lora_config)
 
 # Configure gradient checkpointing and training mode
-if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_loaded:
-    print("[UNSLOTH] Gradient checkpointing optimized automatically")
-    FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
-else:
-    print("[STANDARD] Configuring gradient checkpointing")
-    if USE_GRADIENT_CHECKPOINTING:
-        model_peft.gradient_checkpointing_enable()
-        print("[INFO] Enabled gradient checkpointing for memory efficiency")
-    model_peft.train()
-    print("[FIX] Set model to training mode")
+print("[STANDARD] Configuring gradient checkpointing")
+if USE_GRADIENT_CHECKPOINTING:
+    model_peft.gradient_checkpointing_enable()
+    print("[INFO] Enabled gradient checkpointing for memory efficiency")
+model_peft.train()
+print("[FIX] Set model to training mode")
 
 model_peft.print_trainable_parameters()
 
@@ -796,10 +700,10 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    # ULTRA-AGGRESSIVE MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt)
-    max_completion_length=8000,  #Do not chnage 
+    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 8k context length
+    max_completion_length=8000,  # 8k context length for Qwen2.5
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=600,       # FURTHER REDUCED to save memory for 2 generations
+    max_prompt_length=600,       # REDUCED to save memory for 2 generations
     logging_steps=5,
     save_strategy="steps",
     save_steps=100,
@@ -898,7 +802,7 @@ print("\n--- Inference with GRPO Fine-tuned Model ---")
 try:
     print(f"Loading fine-tuned model from: {FINAL_MODEL_PATH}")
     inference_base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=TORCH_DTYPE, trust_remote_code=True)
+        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
     inference_model = PeftModel.from_pretrained(inference_base_model, FINAL_MODEL_PATH)
     inference_model = inference_model.merge_and_unload()
     
@@ -913,7 +817,7 @@ except Exception as e:
     print("[FALLBACK] Falling back to base model for inference...")
     try:
         inference_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=TORCH_DTYPE, trust_remote_code=True)
+            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
         inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
         if inference_tokenizer.pad_token is None: 
             inference_tokenizer.pad_token = inference_tokenizer.eos_token
