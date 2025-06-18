@@ -213,17 +213,17 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
-    GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
+    BATCH_SIZE_PER_GPU = 20  # Increased for better memory utilization
+    GRAD_ACC_STEPS = 2       # Reduced since batch size increased
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[STANDARD] Using standard training (memory optimized for 15GB GPUs)")
+    print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 1  # Conservative for standard training
-    GRAD_ACC_STEPS = 4      # REDUCED to fit 15GB Tesla T4 memory limit
+    BATCH_SIZE_PER_GPU = 20  # Increased for better memory utilization
+    GRAD_ACC_STEPS = 2       # Reduced since batch size increased
     print(f"[CONFIG] Single GPU mode")
-    print(f"[STANDARD] Using standard training (memory optimized for 15GB GPU)")
+    print(f"[OPTIMIZED] Using increased batch size for better memory utilization")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -242,8 +242,8 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
-print(f"[GPU CONFIG] Using {NUM_GPUS} Tesla T4 GPU with {BATCH_SIZE_PER_GPU} batch size per GPU")
-print(f"[TRAINING CONFIG] Context length: 8000 tokens")
+print(f"[GPU CONFIG] Using {NUM_GPUS} GPU(s) with {BATCH_SIZE_PER_GPU} batch size per GPU")
+print(f"[TRAINING CONFIG] Context length: 16000 tokens")
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
@@ -700,10 +700,10 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 8k context length
-    max_completion_length=8000,  # 8k context length for Qwen2.5
+    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 16k context length
+    max_completion_length=16000,  # 16k context length for better performance
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=600,       # REDUCED to save memory for 2 generations
+    max_prompt_length=1200,       # Increased proportionally with completion length
     logging_steps=5,
     save_strategy="steps",
     save_steps=100,
