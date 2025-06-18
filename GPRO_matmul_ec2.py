@@ -427,34 +427,37 @@ if UNSLOTH_AVAILABLE:
         UNSLOTH_AVAILABLE = False
         unsloth_model_loaded = False
 
-        # Configure tokenizer only if Unsloth succeeded
-        if tokenizer_for_training.pad_token is None:
-            tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-        if tokenizer_for_training.padding_side == 'right':
-            tokenizer_for_training.padding_side = 'left'
+# Only configure tokenizer if Unsloth succeeded
+if UNSLOTH_AVAILABLE and 'unsloth_model_loaded' in locals() and unsloth_model_loaded:
+    if tokenizer_for_training.pad_token is None:
+        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+    if tokenizer_for_training.padding_side == 'right':
+        tokenizer_for_training.padding_side = 'left'
 
-        # Apply chat template for better formatting
-        tokenizer_for_training = get_chat_template(
-            tokenizer_for_training,
-            chat_template="chatml",  # or "llama-3", "zephyr", etc.
-        )
+    # Apply chat template for better formatting
+    tokenizer_for_training = get_chat_template(
+        tokenizer_for_training,
+        chat_template="chatml",  # or "llama-3", "zephyr", etc.
+    )
 
-        # Add LoRA adapters with Unsloth optimization
-        model_peft = FastLanguageModel.get_peft_model(
-            model_peft,
-            r=16,  # LoRA rank
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
-            lora_alpha=16,
-            lora_dropout=0.05,
-            bias="none",
-            use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-            random_state=3407,
-            use_rslora=False,  # Set to True for rank stabilized LoRA
-            loftq_config=None,  # Set to dict for LoftQ
-        )
+    # Add LoRA adapters with Unsloth optimization
+    model_peft = FastLanguageModel.get_peft_model(
+        model_peft,
+        r=16,  # LoRA rank
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
+        random_state=3407,
+        use_rslora=False,  # Set to True for rank stabilized LoRA
+        loftq_config=None,  # Set to dict for LoftQ
+    )
+
+
 # Use standard approach if Unsloth is not available or failed to load
 if not UNSLOTH_AVAILABLE:
     # Fallback to standard PyTorch/transformers approach
