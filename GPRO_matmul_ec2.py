@@ -410,18 +410,22 @@ if UNSLOTH_AVAILABLE:
             dtype = torch.float16
             print("[UNSLOTH] Using float16 (fallback for older GPUs)")
 
-        # Load model and tokenizer with Unsloth optimizations
+                # Load model and tokenizer with Unsloth optimizations
         model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
             model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-            max_seq_length=8000,  # Adjust based on your needs
+            max_seq_length=8000,  # Keep your desired 8K max length
             dtype=dtype,
             load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
             trust_remote_code=True,
         )
-
+        
+        # CRITICAL FIX: Ensure max_seq_length attribute exists for Unsloth compatibility
         if not hasattr(model_peft, 'max_seq_length'):
             model_peft.max_seq_length = 8000
-            print("[FIX] Set max_seq_length attribute for Unsloth compatibility")
+            print("[FIX] Set max_seq_length=8000 attribute for Unsloth compatibility")
+        elif model_peft.max_seq_length != 8000:
+            model_peft.max_seq_length = 8000
+            print("[FIX] Updated max_seq_length to 8000 for consistency")
         
         print("[SUCCESS] Unsloth model loaded successfully!")
         unsloth_model_loaded = True
