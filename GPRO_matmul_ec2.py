@@ -220,7 +220,7 @@ if 'WORLD_SIZE' in os.environ:
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 8  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    BATCH_SIZE_PER_GPU = 4  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
     GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps  
     print(f"[CONFIG] Single GPU mode")
     print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
