@@ -213,14 +213,14 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 32  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    BATCH_SIZE_PER_GPU = 16  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
     GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 32  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    BATCH_SIZE_PER_GPU = 16  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
     GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps  
     print(f"[CONFIG] Single GPU mode")
     print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
