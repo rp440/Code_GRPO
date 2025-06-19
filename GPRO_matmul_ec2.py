@@ -17,6 +17,7 @@ Configuration:
 """
 
 import re
+from unsloth import FastLanguageModel
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 from peft import PeftModel, LoraConfig, get_peft_model
@@ -393,8 +394,6 @@ else:
     print("[SINGLE GPU] Loading model with device_map='auto'")
 
 # Load model using Unsloth for optimized GRPO training
-from unsloth import FastLanguageModel
-
 base_model, tokenizer_for_training = FastLanguageModel.from_pretrained(
     model_name=BASE_MODEL_NAME_FOR_FINETUNING,
     max_seq_length=8000,  # Match your max_completion_length
