@@ -402,7 +402,7 @@ base_model, tokenizer_for_training = FastLanguageModel.from_pretrained(
     trust_remote_code=True,
 )
 
-# Configure model for gradient checkpointing
+# Configure model for gradient checkpointing and GRPO compatibility
 base_model.config.use_cache = False
 print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
@@ -430,6 +430,18 @@ print("[STANDARD] Configuring gradient checkpointing")
 if USE_GRADIENT_CHECKPOINTING:
     model_peft.gradient_checkpointing_enable()
     print("[INFO] Enabled gradient checkpointing for memory efficiency")
+
+# CRITICAL: Force use_cache=False on PEFT model for GRPO compatibility
+# Known bug: GRPO/PPO fails if use_cache=True (shifts decoder_input_ids)
+# Reference: https://github.com/huggingface/transformers/issues/21719
+if hasattr(model_peft, 'config'):
+    model_peft.config.use_cache = False
+if hasattr(model_peft, 'base_model') and hasattr(model_peft.base_model, 'config'):
+    model_peft.base_model.config.use_cache = False
+if hasattr(model_peft, 'pretrained_model') and hasattr(model_peft.pretrained_model, 'config'):
+    model_peft.pretrained_model.config.use_cache = False
+print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility")
+
 model_peft.train()
 print("[FIX] Set model to training mode")
 
@@ -849,6 +861,15 @@ trainer_grpo = GRPOTrainer(
     train_dataset=train_dataset_for_grpo,
     optimizers=(optimizer, None),
 )
+
+# CRITICAL: Ensure reference model also has use_cache=False for GRPO compatibility
+# GRPO internally creates a reference model copy
+if hasattr(trainer_grpo, 'ref_model') and trainer_grpo.ref_model is not None:
+    if hasattr(trainer_grpo.ref_model, 'config'):
+        trainer_grpo.ref_model.config.use_cache = False
+    if hasattr(trainer_grpo.ref_model, 'pretrained_model') and hasattr(trainer_grpo.ref_model.pretrained_model, 'config'):
+        trainer_grpo.ref_model.pretrained_model.config.use_cache = False
+    print("[CRITICAL FIX] Forced use_cache=False on GRPO reference model")
 
 # --- 8. Training Execution ---
 print("Starting GRPO training...")
