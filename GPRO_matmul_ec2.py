@@ -195,8 +195,8 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-# BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-BASE_MODEL_NAME_FOR_FINETUNING = "mlx-community/DeepSeek-R1-Distill-Qwen-7B-8bit"
+BASE_MODEL_NAME_FOR_FINETUNING = "unsloth/DeepSeek-R1-Distill-Qwen-7B-unsloth-bnb-4bit"
+# Using Unsloth 4-bit optimized model for efficient GRPO training
 
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
@@ -392,35 +392,39 @@ else:
     device_map = "auto"
     print("[SINGLE GPU] Loading model with device_map='auto'")
 
-# Model is already 8-bit quantized (mlx-community variant), no additional quantization needed
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_NAME_FOR_FINETUNING,
-    torch_dtype=dtype,
-    device_map=device_map,
-    trust_remote_code=True
+# Load model using Unsloth for optimized GRPO training
+from unsloth import FastLanguageModel
+
+base_model, tokenizer_for_training = FastLanguageModel.from_pretrained(
+    model_name=BASE_MODEL_NAME_FOR_FINETUNING,
+    max_seq_length=8000,  # Match your max_completion_length
+    dtype=dtype,
+    load_in_4bit=True,   # Already 4-bit quantized by Unsloth
+    trust_remote_code=True,
 )
 
 # Configure model for gradient checkpointing
 base_model.config.use_cache = False
 print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
-# Load tokenizer
-tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
+# Tokenizer already loaded by Unsloth, just configure it
 if tokenizer_for_training.pad_token is None:
     tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
 if tokenizer_for_training.padding_side == 'right':
     tokenizer_for_training.padding_side = 'left'
 
-# Create LoRA configuration for Qwen2.5
-lora_config = LoraConfig(
-    task_type="CAUSAL_LM",
+# Apply LoRA using Unsloth's optimized approach
+model_peft = FastLanguageModel.get_peft_model(
+    base_model,
     r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     lora_alpha=32,
     lora_dropout=0.05,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    bias="none"
+    bias="none",
+    use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
+    random_state=3407,
+    use_rslora=False,  # Set to True for better performance with large r values
 )
-model_peft = get_peft_model(base_model, lora_config)
 
 # Configure gradient checkpointing and training mode
 print("[STANDARD] Configuring gradient checkpointing")
