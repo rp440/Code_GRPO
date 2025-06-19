@@ -195,7 +195,9 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+# BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+BASE_MODEL_NAME_FOR_FINETUNING = "mlx-community/DeepSeek-R1-Distill-Qwen-7B-8bit"
+
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
@@ -390,11 +392,19 @@ else:
     device_map = "auto"
     print("[SINGLE GPU] Loading model with device_map='auto'")
 
+# Configure 8-bit quantization
+quantization_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False,
+)
+
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME_FOR_FINETUNING,
     torch_dtype=dtype,
     device_map=device_map,
-    trust_remote_code=True
+    trust_remote_code=True,
+    quantization_config=quantization_config
 )
 
 # Configure model for gradient checkpointing
