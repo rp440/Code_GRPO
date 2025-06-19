@@ -392,19 +392,12 @@ else:
     device_map = "auto"
     print("[SINGLE GPU] Loading model with device_map='auto'")
 
-# Configure 8-bit quantization
-quantization_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    llm_int8_threshold=6.0,
-    llm_int8_has_fp16_weight=False,
-)
-
+# Model is already 8-bit quantized (mlx-community variant), no additional quantization needed
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME_FOR_FINETUNING,
     torch_dtype=dtype,
     device_map=device_map,
-    trust_remote_code=True,
-    quantization_config=quantization_config
+    trust_remote_code=True
 )
 
 # Configure model for gradient checkpointing
