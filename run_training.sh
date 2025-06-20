@@ -17,7 +17,7 @@ pip install --upgrade pip wheel
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Install Unsloth first (it will handle some dependencies optimally)
-pip install unsloth
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 
 # Install other required packages
 pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
