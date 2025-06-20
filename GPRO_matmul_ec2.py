@@ -396,7 +396,7 @@ else:
 # Load model using Unsloth for optimized GRPO training
 base_model, tokenizer_for_training = FastLanguageModel.from_pretrained(
     model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-    max_seq_length=8000,  # Match your max_completion_length
+    max_seq_length=9400,  # Match your max_completion_length
     dtype=dtype,
     load_in_4bit=True,   # Already 4-bit quantized by Unsloth
     trust_remote_code=True,
