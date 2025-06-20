@@ -425,6 +425,10 @@ model_peft = FastLanguageModel.get_peft_model(
     use_rslora=False,  # Set to True for better performance with large r values
 )
 
+# CRITICAL FIX: Prepare model for GRPO training with Unsloth
+# This ensures the model is properly configured for Unsloth's GRPO trainer
+model_peft = FastLanguageModel.for_training(model_peft)
+
 # Configure gradient checkpointing and training mode
 print("[STANDARD] Configuring gradient checkpointing")
 if USE_GRADIENT_CHECKPOINTING:
@@ -442,8 +446,14 @@ if hasattr(model_peft, 'pretrained_model') and hasattr(model_peft.pretrained_mod
     model_peft.pretrained_model.config.use_cache = False
 print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility")
 
+# ADDITIONAL FIX: Ensure model is in correct training state for Unsloth
 model_peft.train()
 print("[FIX] Set model to training mode")
+
+# COMPATIBILITY FIX: Ensure the model doesn't have conflicting attributes
+if hasattr(model_peft, 'llm'):
+    delattr(model_peft, 'llm')
+    print("[FIX] Removed conflicting 'llm' attribute if present")
 
 model_peft.print_trainable_parameters()
 
@@ -853,9 +863,11 @@ if len(train_dataset_for_grpo) < min_samples_needed:
 else:
     print(f"[SUCCESS] Dataset size is sufficient for distributed training")
 
+# CRITICAL FIX: Use standard TRL GRPOTrainer with proper tokenizer parameter
+# Unsloth models work with standard TRL trainers when properly configured
 trainer_grpo = GRPOTrainer(
     model=model_peft,
-    processing_class=tokenizer_for_training,  # CRITICAL FIX: Use processing_class parameter (from reference)
+    tokenizer=tokenizer_for_training,  # Use tokenizer parameter instead of processing_class for compatibility
     reward_funcs=[matrix_dsl_reward],
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,
