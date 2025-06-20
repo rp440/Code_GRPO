@@ -400,6 +400,7 @@ base_model, tokenizer_for_training = FastLanguageModel.from_pretrained(
     dtype=dtype,
     load_in_4bit=True,   # Already 4-bit quantized by Unsloth
     trust_remote_code=True,
+    fast_inference     = True, 
 )
 
 # Configure model for gradient checkpointing and GRPO compatibility
@@ -815,6 +816,7 @@ training_args_grpo = GRPOConfig(
     learning_rate=NEW_LEARNING_RATE,
     remove_unused_columns=False,
     gradient_accumulation_steps=GRAD_ACC_STEPS,
+    use_vllm                    = True,
     num_train_epochs=EPOCHS,
     bf16=use_bf16,
     fp16=use_fp16,

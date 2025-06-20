@@ -22,6 +22,9 @@ pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 # Install other required packages
 pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
 
+# Install vLLM for optimized inference
+pip install "vllm>=0.8.5"
+
 # Verify installations
 python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
