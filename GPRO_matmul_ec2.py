@@ -964,11 +964,10 @@ if len(train_dataset_for_grpo) < min_samples_needed:
 else:
     print(f"[SUCCESS] Dataset size is sufficient for distributed training")
 
-# Use standard TRL GRPOTrainer with proper tokenizer parameter
-# Standard models work with TRL trainers when properly configured
+# Use standard TRL GRPOTrainer 
+# GRPOTrainer automatically extracts tokenizer from the model
 trainer_grpo = GRPOTrainer(
     model=model_peft,
-    tokenizer=tokenizer_for_training,  # Use tokenizer parameter instead of processing_class for compatibility
     reward_funcs=[matrix_dsl_reward],
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,

@@ -21,7 +21,7 @@ pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
 
 # Install Unsloth for 2x faster training and 50% memory reduction
 echo "Installing Unsloth for optimized training..."
-pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install "unsloth==2025.6.15"
 
 # Install vLLM for optimized inference
 pip install "vllm>=0.8.5"
