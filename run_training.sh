@@ -13,18 +13,26 @@ source ./myproject311/bin/activate
 # Update pip and install wheel
 pip install --upgrade pip wheel
 
-# Install PyTorch with CUDA 12.1 (compatible with your CUDA 12.8 system)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Option 1: Install from frozen requirements (recommended for exact reproducibility)
+if [ -f "requirements.txt" ]; then
+    echo "Installing from frozen requirements.txt for exact reproducibility..."
+    pip install -r requirements.txt
+else
+    echo "requirements.txt not found, installing packages individually..."
+    
+    # Install PyTorch with CUDA 12.1 (compatible with your CUDA 12.8 system)
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Install required packages
-pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
+    # Install required packages
+    pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
 
-# Install Unsloth for 2x faster training and 50% memory reduction
-echo "Installing Unsloth for optimized training..."
-pip install "unsloth==2025.6.15"
+    # Install Unsloth for 2x faster training and 50% memory reduction
+    echo "Installing Unsloth for optimized training..."
+    pip install "unsloth==2025.6.15"
 
-# Install vLLM for optimized inference
-pip install "vllm>=0.8.5"
+    # Install vLLM for optimized inference
+    pip install "vllm>=0.8.5"
+fi
 
 # Verify installations
 python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
