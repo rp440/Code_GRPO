@@ -1,9 +1,9 @@
 #!/bin/bash
-sudo apt update
-sudo apt install software-properties-common -y
-sudo add-apt-repository ppa:deadsnakes/ppa -y
-sudo apt update
-sudo apt install python3.11 python3.11-venv python3.11-dev python3.11-distutils -y
+ apt update
+ apt install software-properties-common -y
+ add-apt-repository ppa:deadsnakes/ppa -y
+ apt update
+ apt install python3.11 python3.11-venv python3.11-dev python3.11-distutils -y
 
 python3.11 -m venv myproject311
 
@@ -26,10 +26,6 @@ else
     # Install required packages
     pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
 
-    # Install Unsloth for 2x faster training and 50% memory reduction
-    echo "Installing Unsloth for optimized training..."
-    pip install "unsloth==2025.6.15"
-
     # Install vLLM for optimized inference
     pip install "vllm>=0.8.5"
 fi
@@ -39,20 +35,20 @@ python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 python -c "import torch; print(f'NCCL version: {torch.cuda.nccl.version()}')" || echo "NCCL not available"
 
-# Verify Unsloth installation
-echo "Verifying Unsloth installation..."
+# Verify transformers installation
+echo "Verifying transformers installation..."
 python -c "
 try:
-    from unsloth import FastLanguageModel
-    from unsloth import is_bfloat16_supported
-    print('✅ Unsloth successfully installed and ready for 2x faster training!')
-    print(f'   - bfloat16 supported: {is_bfloat16_supported()}')
+    import transformers
+    import peft
+    print('✅ Transformers and PEFT successfully installed!')
+    print(f'   - Transformers version: {transformers.__version__}')
+    print(f'   - Using 8-bit quantization with 4k context length')
 except ImportError as e:
-    print(f'⚠️  Unsloth not available: {e}')
-    print('   - Training will fall back to standard PyTorch (still works but slower)')
+    print(f'⚠️  Import error: {e}')
+    print('   - Please check your installations')
 except Exception as e:
-    print(f'⚠️  Unsloth import error: {e}')
-    print('   - Training will fall back to standard PyTorch')
+    print(f'⚠️  Error: {e}')
 "
 
 # Create necessary directories
@@ -97,9 +93,9 @@ if [ "$GPU_COUNT" -eq 4 ]; then
     echo "🚀 **4 GPU DISTRIBUTED TRAINING MODE**"
     echo "   - GPUs: 4x Tesla T4 (15GB each)"
     echo "   - Total VRAM: 60GB"
-    echo "   - Mode: Multi-GPU GRPO training with Unsloth optimization"
-    echo "   - Expected batch size: 2 per GPU (total effective: 32)"
-    echo "   - Performance: 2x faster training, 50% memory reduction with Unsloth"
+    echo "   - Mode: Multi-GPU GRPO training with 8-bit quantization"
+    echo "   - Expected batch size: 8 per GPU (total effective: 64)"
+    echo "   - Configuration: 8-bit quantization with 4k context length"
     
     # Set optimal environment for 4 GPU training
     export NCCL_DEBUG=INFO
@@ -166,7 +162,7 @@ fi
 
 echo ""
 echo "🎯 **Training completed!**"
-echo "   - Training optimized with Unsloth (2x faster, 50% memory reduction)"
+echo "   - Training using 8-bit quantization with 4k context length"
 echo "   - Check tensorboard logs for training progress"
 echo "   - Model saved to: /home/ec2-user/matmul_outputs/models/"
 echo "   - Discovery logs saved in outputs directory" 

@@ -8,17 +8,16 @@ Key Features:
 4. New L1 error-based reward function:
    - Correct result: score = (10 - mul_ops)
    - Incorrect result: score = (-dist/5 - 0.2*mul_ops)
-5. Unsloth optimization for 2x faster training and 50% memory reduction
+5. 8-bit quantization for memory efficiency with 4k context length
 
 Configuration:
 - Set LOAD_FROM_CHECKPOINT = False to train from scratch
 - Adjust CHECKPOINT_PATH to your previous model path
 - Modify NEW_LEARNING_RATE as needed
 - Configured for 4 GPUs with distributed training
-- Automatic Unsloth optimization with fallback to standard training
+- Uses 8-bit quantization with 4k context length
 
 Installation Requirements:
-- For Unsloth: pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 - Standard dependencies: pip install -U trl peft transformers datasets huggingface_hub accelerate torch bitsandbytes
 """
 
@@ -40,22 +39,12 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# Unsloth imports for optimized training (with fallback)
-try:
-    from unsloth import FastLanguageModel
-    from unsloth import is_bfloat16_supported
-    from unsloth.chat_templates import get_chat_template
-    UNSLOTH_AVAILABLE = True
-    print("[UNSLOTH] Successfully imported Unsloth optimizations")
-except ImportError as e:
-    print(f"[WARNING] Unsloth not available: {e}")
-    print("[FALLBACK] Will use standard PyTorch/transformers training")
-    UNSLOTH_AVAILABLE = False
-    
-    # Fallback function
-    def is_bfloat16_supported():
-        """Check if bfloat16 is supported on the current GPU"""
-        return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+# Standard PyTorch/transformers training (no Unsloth)
+UNSLOTH_AVAILABLE = False
+
+def is_bfloat16_supported():
+    """Check if bfloat16 is supported on the current GPU"""
+    return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
 
 # --- Initialize Distributed Training Environment ---
 # CRITICAL: Set memory optimization environment variables BEFORE any CUDA operations
@@ -216,7 +205,7 @@ C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_I
 
 # --- 3. GRPO Configuration and System Prompt ---
 BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-# Using standard 4-bit quantized model for efficient GRPO training
+# Using 8-bit quantized model for efficient GRPO training
 
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
@@ -235,17 +224,17 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 16  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    BATCH_SIZE_PER_GPU = 8   # Reduced batch size for 4k context and 8-bit quantization
     GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
+    print(f"[CONFIG] Using 8-bit quantization with 4k context length")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4  # Significantly increased to utilize 80GB RAM (4x from 20GB usage)
+    BATCH_SIZE_PER_GPU = 4   # Reduced batch size for 4k context and 8-bit quantization
     GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps  
     print(f"[CONFIG] Single GPU mode")
-    print(f"[OPTIMIZED] Using high batch size to maximize 80GB RAM utilization")
+    print(f"[CONFIG] Using 8-bit quantization with 4k context length")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -265,7 +254,7 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 print(f"[GPU CONFIG] Using {NUM_GPUS} GPU(s) with {BATCH_SIZE_PER_GPU} batch size per GPU")
-print(f"[TRAINING CONFIG] Context length: 16000 tokens")
+print(f"[TRAINING CONFIG] Context length: 4000 tokens")
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
@@ -393,141 +382,75 @@ except Exception as e:
     exit(1)
 
 # --- 5. Model Loading and PEFT Setup ---
-if UNSLOTH_AVAILABLE:
-    print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    # Determine optimal dtype for the hardware
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[UNSLOTH] Using float16 (fallback for older GPUs)")
+print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
 
-    # Configure max sequence length for GRPO training
-    max_seq_length = 16384  # Increased for better performance, matching training config
-    
-    # Load model and tokenizer with Unsloth optimizations
-    # Note: Unsloth handles device_map automatically for distributed training
-    model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-        max_seq_length=max_seq_length,
-        dtype=dtype,
-        load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
-        trust_remote_code=True,
-        # Unsloth automatically handles device placement for distributed training
-    )
-
-    # Configure tokenizer
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
-
-    # Apply chat template for better formatting (optional, but recommended)
-    try:
-        tokenizer_for_training = get_chat_template(
-            tokenizer_for_training,
-            chat_template="chatml",  # Compatible with most models
-        )
-        print("[UNSLOTH] Applied optimized chat template")
-    except Exception as e:
-        print(f"[UNSLOTH] Chat template not applied: {e}, continuing with default")
-
-    # Add LoRA adapters with Unsloth optimization
-    model_peft = FastLanguageModel.get_peft_model(
-        model_peft,
-        r=16,  # LoRA rank
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-        random_state=3407,
-        use_rslora=False,  # Set to True for rank stabilized LoRA
-        loftq_config=None,  # Set to dict for LoftQ
-    )
-    
-    # Enable training mode with Unsloth optimizations
-    FastLanguageModel.for_training(model_peft)
-    print("[UNSLOTH] Model prepared for training with optimizations")
-    
+# Determine optimal dtype
+if is_bfloat16_supported():
+    dtype = torch.bfloat16
+    print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
 else:
-    # Fallback to standard PyTorch/transformers approach
-    print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    # Determine optimal dtype
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[STANDARD] Using float16 (fallback for older GPUs)")
+    dtype = torch.float16
+    print("[STANDARD] Using float16 (fallback for older GPUs)")
 
-    # Configure device map for distributed vs single GPU
-    if 'RANK' in os.environ:
-        device_map = None
-        print("[DISTRIBUTED] Loading model without device_map for distributed training")
-    else:
-        device_map = "auto"
-        print("[SINGLE GPU] Loading model with device_map='auto'")
+# Configure device map for distributed vs single GPU
+if 'RANK' in os.environ:
+    device_map = None
+    print("[DISTRIBUTED] Loading model without device_map for distributed training")
+else:
+    device_map = "auto"
+    print("[SINGLE GPU] Loading model with device_map='auto'")
 
-    # Load model using standard transformers approach
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=dtype,
-        bnb_4bit_use_double_quant=True,
-    )
+# Load model using standard transformers approach with 8-bit quantization
+quantization_config = BitsAndBytesConfig(
+    load_in_8bit=True,  # Using 8-bit quantization instead of 4-bit
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False,
+)
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING,
-        quantization_config=quantization_config,
-        torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-    )
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME_FOR_FINETUNING,
+    quantization_config=quantization_config,
+    torch_dtype=dtype,
+    device_map=device_map,
+    trust_remote_code=True,
+)
 
-    tokenizer_for_training = AutoTokenizer.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING,
-        trust_remote_code=True,
-    )
+tokenizer_for_training = AutoTokenizer.from_pretrained(
+    BASE_MODEL_NAME_FOR_FINETUNING,
+    trust_remote_code=True,
+)
 
-    # Configure model for gradient checkpointing and GRPO compatibility
-    base_model.config.use_cache = False
-    print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
+# Configure model for gradient checkpointing and GRPO compatibility
+base_model.config.use_cache = False
+print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
-    # Configure tokenizer
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
+# Configure tokenizer
+if tokenizer_for_training.pad_token is None:
+    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+if tokenizer_for_training.padding_side == 'right':
+    tokenizer_for_training.padding_side = 'left'
 
-    # Apply LoRA using standard PEFT approach
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        use_rslora=False,  # Set to True for better performance with large r values
-    )
+# Apply LoRA using standard PEFT approach
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    use_rslora=False,  # Set to True for better performance with large r values
+)
 
-    model_peft = get_peft_model(base_model, lora_config)
+model_peft = get_peft_model(base_model, lora_config)
 
 # Prepare model for GRPO training
-if not UNSLOTH_AVAILABLE:
-    # Standard approach - configure manually
-    model_peft.train()
-    
-    # Configure gradient checkpointing for standard approach
-    print("[STANDARD] Configuring gradient checkpointing")
-    if USE_GRADIENT_CHECKPOINTING:
-        model_peft.gradient_checkpointing_enable()
-        print("[INFO] Enabled gradient checkpointing for memory efficiency")
+# Standard approach - configure manually
+model_peft.train()
+
+# Configure gradient checkpointing for standard approach
+print("[STANDARD] Configuring gradient checkpointing")
+if USE_GRADIENT_CHECKPOINTING:
+    model_peft.gradient_checkpointing_enable()
+    print("[INFO] Enabled gradient checkpointing for memory efficiency")
 
 # CRITICAL: Force use_cache=False on PEFT model for GRPO compatibility
 # Known bug: GRPO/PPO fails if use_cache=True (shifts decoder_input_ids)
@@ -539,16 +462,10 @@ if hasattr(model_peft, 'base_model') and hasattr(model_peft.base_model, 'config'
 if hasattr(model_peft, 'pretrained_model') and hasattr(model_peft.pretrained_model, 'config'):
     model_peft.pretrained_model.config.use_cache = False
 
-if UNSLOTH_AVAILABLE:
-    print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility (Unsloth)")
-else:
-    print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility (Standard)")
+print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility (Standard)")
 
 # Ensure model is in correct training state
-if not UNSLOTH_AVAILABLE:
-    print("[FIX] Set model to training mode (Standard)")
-else:
-    print("[INFO] Model training mode handled by Unsloth")
+print("[FIX] Set model to training mode (Standard)")
 
 # COMPATIBILITY FIX: Ensure the model doesn't have conflicting attributes
 if hasattr(model_peft, 'llm'):
@@ -920,10 +837,10 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 16k context length
-    max_completion_length=8000,  # 16k context length for better performance
+    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 4k context length
+    max_completion_length=2000,  # 4k context length
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=1200,       # Increased proportionally with completion length
+    max_prompt_length=600,        # Reduced proportionally with completion length
     logging_steps=5,
     save_strategy="steps",
     save_steps=100,
@@ -1030,72 +947,35 @@ trainer_grpo.save_model(FINAL_MODEL_PATH)
 # --- 10. Inference and Verification ---
 print("\n--- Inference with GRPO Fine-tuned Model ---")
 
-if UNSLOTH_AVAILABLE:
-    # Use Unsloth for optimized inference
-    print(f"Loading fine-tuned Unsloth model from: {FINAL_MODEL_PATH}")
+# Standard approach
+try:
+    print(f"Loading fine-tuned model from: {FINAL_MODEL_PATH}")
+    inference_base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
+    inference_model = PeftModel.from_pretrained(inference_base_model, FINAL_MODEL_PATH)
+    inference_model = inference_model.merge_and_unload()
+    
+    inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
+    if inference_tokenizer.pad_token is None: 
+        inference_tokenizer.pad_token = inference_tokenizer.eos_token
+    if inference_tokenizer.padding_side == 'right': 
+        inference_tokenizer.padding_side = 'left'
+    print("[SUCCESS] Fine-tuned model loaded for inference.")
+except Exception as e:
+    print(f"[ERROR] Error loading fine-tuned model: {e}")
+    print("[FALLBACK] Falling back to base model for inference...")
     try:
-        # Load the model with Unsloth for fast inference
-        inference_model, inference_tokenizer = FastLanguageModel.from_pretrained(
-            model_name=FINAL_MODEL_PATH,  # Load the saved adapter directly
-            max_seq_length=max_seq_length,
-            dtype=dtype,
-            load_in_4bit=True,
-            trust_remote_code=True,
-        )
-        
-        # Enable fast inference mode
-        FastLanguageModel.for_inference(inference_model)
-        print("[SUCCESS] Unsloth fine-tuned model loaded for fast inference.")
-        
-    except Exception as e:
-        print(f"[ERROR] Error loading Unsloth fine-tuned model: {e}")
-        print("[FALLBACK] Falling back to standard loading...")
-        try:
-            # Fallback to standard loading for Unsloth models
-            inference_base_model = AutoModelForCausalLM.from_pretrained(
-                BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
-            inference_model = PeftModel.from_pretrained(inference_base_model, FINAL_MODEL_PATH)
-            inference_model = inference_model.merge_and_unload()
-            
-            inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-            if inference_tokenizer.pad_token is None: 
-                inference_tokenizer.pad_token = inference_tokenizer.eos_token
-            if inference_tokenizer.padding_side == 'right': 
-                inference_tokenizer.padding_side = 'left'
-            print("[FALLBACK] Standard PEFT model loaded for inference.")
-        except Exception as fallback_e:
-            print(f"[ERROR] Error loading fallback model: {fallback_e}. Exiting.")
-            exit()
-else:
-    # Standard approach
-    try:
-        print(f"Loading fine-tuned model from: {FINAL_MODEL_PATH}")
-        inference_base_model = AutoModelForCausalLM.from_pretrained(
+        inference_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
-        inference_model = PeftModel.from_pretrained(inference_base_model, FINAL_MODEL_PATH)
-        inference_model = inference_model.merge_and_unload()
-        
         inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
         if inference_tokenizer.pad_token is None: 
             inference_tokenizer.pad_token = inference_tokenizer.eos_token
         if inference_tokenizer.padding_side == 'right': 
             inference_tokenizer.padding_side = 'left'
-        print("[SUCCESS] Fine-tuned model loaded for inference.")
-    except Exception as e:
-        print(f"[ERROR] Error loading fine-tuned model: {e}")
-        print("[FALLBACK] Falling back to base model for inference...")
-        try:
-            inference_model = AutoModelForCausalLM.from_pretrained(
-                BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
-            inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-            if inference_tokenizer.pad_token is None: 
-                inference_tokenizer.pad_token = inference_tokenizer.eos_token
-            if inference_tokenizer.padding_side == 'right': 
-                inference_tokenizer.padding_side = 'left'
-            print("[FALLBACK] Using base model for inference.")
-        except Exception as fallback_e:
-            print(f"[ERROR] Error loading base model for inference: {fallback_e}. Exiting.")
-            exit()
+        print("[FALLBACK] Using base model for inference.")
+    except Exception as fallback_e:
+        print(f"[ERROR] Error loading base model for inference: {fallback_e}. Exiting.")
+        exit()
 
 text_gen_pipeline = pipeline(
     "text-generation", 
@@ -1182,8 +1062,4 @@ print(f"[DISCOVERIES] Log: {DISCOVERIES_LOG_FILE}")
 final_best_summary = _best_n_mults if _best_n_mults != float('inf') else 'None found'
 print(f"[BEST SOLUTION] {final_best_summary} multiplications")
 print(f"[TIP] To view TensorBoard: tensorboard --logdir {FINAL_TENSORBOARD_PATH}")
-if UNSLOTH_AVAILABLE:
-    print(f"[UNSLOTH] Training completed with Unsloth optimizations (2x faster, 50% less memory)")
-else:
-    print(f"[STANDARD] Training completed with standard PyTorch/transformers")
-print(f"[INFO] To install Unsloth for next time: pip install \"unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git\"") 
+print(f"[STANDARD] Training completed with standard PyTorch/transformers using 8-bit quantization") 
