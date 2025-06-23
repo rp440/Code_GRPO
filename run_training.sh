@@ -30,7 +30,7 @@ pip install --upgrade pip wheel
 
     # Install vLLM for optimized inference
     pip install "vllm>=0.8.5"
-fi
+
 
 # Verify installations
 python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
