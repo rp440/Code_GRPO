@@ -16,11 +16,11 @@ source ./myproject311/bin/activate
 pip install --upgrade pip wheel
 
 # Option 1: Install from frozen requirements (recommended for exact reproducibility)
-if [ -f "requirements.txt" ]; then
-    echo "Installing from frozen requirements.txt for exact reproducibility..."
-    pip install -r requirements.txt
-else
-    echo "requirements.txt not found, installing packages individually..."
+# if [ -f "requirements.txt" ]; then
+#     echo "Installing from frozen requirements.txt for exact reproducibility..."
+#     pip install -r requirements.txt
+# else
+#     echo "requirements.txt not found, installing packages individually..."
     
     # Install PyTorch with CUDA 12.1 (compatible with your CUDA 12.8 system)
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
