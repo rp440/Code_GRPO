@@ -5,15 +5,15 @@ Key Features:
 1. Load previous LoRA checkpoint but discard optimizer state
 2. Create fresh AdamW optimizer with configurable learning rate  
 3. Reset value head parameters for fresh training
-4. New L2 error-based reward function with exploration prioritization
-5. Unsloth optimization for 2x faster training and 50% memory reduction
-6. Upgraded to Qwen2-7B-Instruct for better performance
+4. Simple reward function: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers
+5. Standard PyTorch/transformers training
+6. Using Qwen2-1.5B model
 
 Configuration:
 - Set LOAD_FROM_CHECKPOINT = False to train from scratch
 - Adjust CHECKPOINT_PATH to your previous model path
 - Modify NEW_LEARNING_RATE as needed
-- Automatic Unsloth optimization with fallback to standard training
+- Standard PyTorch/transformers training
 """
 
 import re
@@ -32,21 +32,11 @@ import random
 import json
 import math
 
-# Unsloth imports for optimized training (with fallback)
-try:
-    from unsloth import FastLanguageModel
-    from unsloth import is_bfloat16_supported
-    from unsloth.chat_templates import get_chat_template
-    UNSLOTH_AVAILABLE = True
-    print("[UNSLOTH] Successfully imported Unsloth optimizations")
-except ImportError as e:
-    print(f"[WARNING] Unsloth not available: {e}")
-    print("[FALLBACK] Will use standard PyTorch/transformers training")
-    UNSLOTH_AVAILABLE = False
-    
-    # Fallback functions
-    def is_bfloat16_supported():
-        return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+# Standard PyTorch/transformers training (Unsloth removed)
+UNSLOTH_AVAILABLE = False
+
+def is_bfloat16_supported():
+    return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
 
 # --- 0. Hugging Face Login ---
 try:
@@ -61,7 +51,7 @@ except Exception as e:
 
 # --- 1. Mount Google Drive & Paths ---
 DRIVE_MOUNT_PATH = '/content/drive'
-MODEL_SAVE_PARENT_DIR_DRIVE = os.path.join(DRIVE_MOUNT_PATH, "MyDrive", "Matmul_GRPO_Finetuned_JSONL")
+MODEL_SAVE_PARENT_DIR_DRIVE = "/content/drive/MyDrive/Qwen_DSL_FineTune_big_GRPO_runs/qwen_dsl_finetuned_adapter/"
 TENSORBOARD_LOGS_DRIVE = os.path.join(DRIVE_MOUNT_PATH, "MyDrive", "Matmul_GRPO_TensorBoard_Logs")
 DATASET_PATH = "/content/matrix_io_data_for_grpo.jsonl"
 
@@ -115,14 +105,39 @@ class DSLExecutor:
         self.variables[target_var] = result
     
     def _evaluate_expression(self, expression, original_step_line):
-        """Evaluate an expression that may contain chained +/- operations"""
+        """Evaluate an expression that may contain chained +/- operations or complex parenthetical expressions"""
         expression = expression.strip()
         
         # Simple assignment (no operators) - check for variable names or numbers only
-        # Must be: variable name, matrix element, or number (no spaces around operators)
         assign_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
         if assign_match:
             return self._get_value(assign_match.group(1).strip())
+        
+        # Handle parenthetical expressions first - simple cases like (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
+        paren_mult_match = re.match(r"^\s*\(([^)]+)\)\s*\*\s*\(([^)]+)\)\s*$", expression)
+        if paren_mult_match:
+            left_expr = paren_mult_match.group(1).strip()
+            right_expr = paren_mult_match.group(2).strip()
+            left_val = self._evaluate_simple_expression(left_expr)
+            right_val = self._evaluate_simple_expression(right_expr)
+            return left_val * right_val
+        
+        # Handle expression * variable or variable * expression cases
+        mult_var_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?)\s*\*\s*\(([^)]+)\)\s*$", expression)
+        if mult_var_match:
+            var_name = mult_var_match.group(1).strip()
+            expr = mult_var_match.group(2).strip()
+            var_val = self._get_value(var_name)
+            expr_val = self._evaluate_simple_expression(expr)
+            return var_val * expr_val
+            
+        var_mult_match = re.match(r"^\s*\(([^)]+)\)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?)\s*$", expression)
+        if var_mult_match:
+            expr = var_mult_match.group(1).strip()
+            var_name = var_mult_match.group(2).strip()
+            expr_val = self._evaluate_simple_expression(expr)
+            var_val = self._get_value(var_name)
+            return expr_val * var_val
         
         # Single binary operation (backward compatibility)
         binary_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*([*+-])\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
@@ -137,8 +152,53 @@ class DSLExecutor:
             elif operator == '-': return val1 - val2
             else: raise ValueError(f"Unsupported operator '{operator}' in expression: '{expression}'")
         
-        # Chained operations (e.g., M1 + M4 - M5 + M7)
-        # Split by + and - while preserving operators, but be careful with negative numbers
+        # Chained operations (e.g., M2 + M3 - M5 + M6)
+        return self._evaluate_chained_expression(expression, original_step_line)
+    
+    def _evaluate_simple_expression(self, expression):
+        """Evaluate simple expressions within parentheses (addition/subtraction only)"""
+        expression = expression.strip()
+        
+        # Single variable or number
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?$|^\-?\d+(?:\.\d+)?$", expression):
+            return self._get_value(expression)
+        
+        # Split by + and - operators
+        tokens = re.split(r'(\s*[+-]\s*)', expression)
+        if len(tokens) == 1:
+            return self._get_value(expression.strip())
+        
+        # First term
+        result = self._get_value(tokens[0].strip())
+        
+        # Process remaining terms
+        i = 1
+        while i < len(tokens):
+            if i + 1 >= len(tokens):
+                break
+            operator = tokens[i].strip()
+            operand = tokens[i + 1].strip()
+            
+            if not operator or not operand:
+                i += 2
+                continue
+                
+            value = self._get_value(operand)
+            
+            if operator == '+': 
+                result += value
+            elif operator == '-': 
+                result -= value
+            else: 
+                raise ValueError(f"Unsupported operator '{operator}' in simple expression: '{expression}'")
+            
+            i += 2
+        
+        return result
+    
+    def _evaluate_chained_expression(self, expression, original_step_line):
+        """Evaluate chained +/- operations like M2 + M3 - M5 + M6"""
+        # Split by + and - while preserving operators
         tokens = re.split(r'(\s*[+-]\s*)', expression)
         if len(tokens) == 1:
             raise ValueError(f"Malformed expression: '{expression}' in DSL line: '{original_step_line}'")
@@ -162,9 +222,12 @@ class DSLExecutor:
                 
             value = self._get_value(operand)
             
-            if operator == '+': result += value
-            elif operator == '-': result -= value
-            else: raise ValueError(f"Unsupported operator '{operator}' in chained expression: '{expression}'")
+            if operator == '+': 
+                result += value
+            elif operator == '-': 
+                result -= value
+            else: 
+                raise ValueError(f"Unsupported operator '{operator}' in chained expression: '{expression}'")
             
             i += 2
         
@@ -194,6 +257,75 @@ def manual_matrix_multiply_2x2(A, B):
     C[1][1] = A[1][0] * B[0][1] + A[1][1] * B[1][1]
     return C
 
+def count_multiplications_in_dsl(dsl_script):
+    """
+    Count the number of multiplication operations in a DSL script.
+    Handles various formats including parenthetical expressions and chained operations.
+    """
+    count = 0
+    lines = dsl_script.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line or not '=' in line:
+            continue
+            
+        # Split at = to get the expression part
+        parts = line.split('=', 1)
+        if len(parts) != 2:
+            continue
+            
+        expression = parts[1].strip()
+        
+        # Count multiplication operators in the expression
+        # But be careful not to count multiplications inside variable names or matrix indices
+        
+        # Patterns that indicate multiplication:
+        # 1. (expr) * (expr) - parenthetical multiplication
+        # 2. var * (expr) - variable times parenthetical expression
+        # 3. (expr) * var - parenthetical expression times variable
+        # 4. var * var - simple variable multiplication
+        # 5. A[i,j] * B[k,l] - matrix element multiplication
+        
+        mult_patterns = [
+            r'\([^)]+\)\s*\*\s*\([^)]+\)',  # (expr) * (expr)
+            r'[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?\s*\*\s*\([^)]+\)',  # var * (expr)
+            r'\([^)]+\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?',  # (expr) * var
+            r'[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?\s*\*\s*[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?',  # var * var
+        ]
+        
+        # Find all multiplication operations in this line
+        temp_expression = expression
+        line_mult_count = 0
+        
+        for pattern in mult_patterns:
+            matches = re.findall(pattern, temp_expression)
+            line_mult_count += len(matches)
+            
+            # Remove found matches to avoid double counting
+            temp_expression = re.sub(pattern, 'PLACEHOLDER', temp_expression)
+        
+        # Additional check: count remaining * operators that might not match patterns above
+        # But exclude those inside matrix indices [i,j] or function calls
+        remaining_expression = temp_expression
+        # Remove matrix indices and function-like constructs
+        remaining_expression = re.sub(r'\[[^\]]+\]', '', remaining_expression)
+        remaining_expression = re.sub(r'PLACEHOLDER', '', remaining_expression)
+        
+        # Count remaining * that aren't already accounted for
+        additional_mults = remaining_expression.count('*')
+        
+        # Sanity check: a well-formed multiplication line should have exactly 1 multiplication
+        # If we find more than 1, log it but proceed
+        total_line_mults = max(line_mult_count, additional_mults)
+        if total_line_mults > 1:
+            print(f"[MULT COUNT WARNING] Line '{line}' appears to have {total_line_mults} multiplications")
+        
+        # Count ALL multiplications in this line, not just limit to 1
+        count += total_line_mults
+            
+    return count
+
 def _generate_random_2x2_matrix_for_inference(low=-99, high=99):
     return [[random.randint(low, high) for _ in range(2)] for _ in range(2)]
 
@@ -202,7 +334,7 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2-7B-Instruct"
+BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2-1.5B"
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
 LOCAL_TRAINED_MODEL_PATH = f"/content/{TRAINED_MODEL_DIR_NAME}"
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -215,27 +347,18 @@ LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 # Training configuration optimized for Colab
 EPOCHS = 1
 
-# Auto-configure based on Unsloth availability - OPTIMIZED FOR COLAB MEMORY
-if UNSLOTH_AVAILABLE:
-    BATCH_SIZE = 1  # REDUCED to avoid hanging on first batch
-    GRAD_ACC_STEPS = 4  # Optimized for Colab memory limit
-    print(f"[CONFIG] Colab with Unsloth optimizations (memory optimized)")
-    print(f"[UNSLOTH] Using Unsloth optimizations for improved memory efficiency")
-else:
-    BATCH_SIZE = 1  # Conservative for standard training
-    GRAD_ACC_STEPS = 4  # REDUCED to avoid hanging on first batch
-    print(f"[CONFIG] Colab with standard training (memory optimized)")
-    print(f"[STANDARD] Using standard training (conservative memory usage)")
+# Training configuration
+BATCH_SIZE = 4
+GRAD_ACC_STEPS = 16
+print(f"[CONFIG] Standard training configuration")
+print(f"[STANDARD] Batch size: {BATCH_SIZE}, Gradient accumulation: {GRAD_ACC_STEPS}")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE * GRAD_ACC_STEPS
 model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}_colab"  # Include key training params
-drive_model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
-drive_logs_name = f"runs_{model_config_desc}_{timestamp}"
-
 if USE_DRIVE_FOR_SAVING:
-    DRIVE_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_PARENT_DIR_DRIVE, drive_model_name)
-    DRIVE_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DRIVE, drive_logs_name)
+    DRIVE_TRAINED_MODEL_PATH = MODEL_SAVE_PARENT_DIR_DRIVE
+    DRIVE_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DRIVE, f"runs_{model_config_desc}_{timestamp}")
     print(f"[SAVE CONFIG] Model will be saved to: {DRIVE_TRAINED_MODEL_PATH}")
     print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {DRIVE_TENSORBOARD_PATH}")
 else:
@@ -250,14 +373,10 @@ M1 = (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
 M2 = (A[1,0] + A[0,1]) * (B[0,1])
 M3 = A[1,1] * (B[0,0] - B[1,1])
 M4 = A[0,0] * (B[1,1] + B[0,0])
-M5 = (A[0,1] + A[1,1]) * (B[0,0])
-M6 = (A[1,0] - A[0,0]) * (B[1,0] - B[0,1])
-M7 = (A[0,0] + A[1,0]) * (B[0,1] - B[1,1])
+
 
 C[0,0] = M2 + M3 - M5 + M6
 C[0,1] = M1 + M6 - M4
-C[1,0] = M7 - M2 + M1
-C[1,1] = M3 - M4 + M5 - M7
 </DSL>
 
 This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.  YOUR TASK: Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags. 
@@ -368,117 +487,105 @@ except Exception as e:
     exit(1)
 
 # --- 5. Model Loading and PEFT Setup ---
-if UNSLOTH_AVAILABLE:
-    print(f"Loading base model with Unsloth optimization: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    # Determine optimal dtype for the hardware
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[UNSLOTH] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[UNSLOTH] Using float16 (fallback for older GPUs)")
+print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
 
-    # Load model and tokenizer with Unsloth optimizations
-    model_peft, tokenizer_for_training = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL_NAME_FOR_FINETUNING,
-        max_seq_length=2048,  # REDUCED for Colab memory constraints
-        dtype=dtype,
-        load_in_4bit=True,  # Enable 4-bit quantization for memory efficiency
-        trust_remote_code=True,
-    )
-
-    # Configure tokenizer
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
-
-    # Apply chat template for better formatting
-    tokenizer_for_training = get_chat_template(
-        tokenizer_for_training,
-        chat_template="chatml",  # or "llama-3", "zephyr", etc.
-    )
-
-    # Add LoRA adapters with Unsloth optimization
-    model_peft = FastLanguageModel.get_peft_model(
-        model_peft,
-        r=16,  # LoRA rank
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        use_gradient_checkpointing="unsloth",  # Unsloth's optimized gradient checkpointing
-        random_state=3407,
-        use_rslora=False,  # Set to True for rank stabilized LoRA
-        loftq_config=None,  # Set to dict for LoftQ
-    )
-    
+# Determine optimal dtype
+if is_bfloat16_supported():
+    dtype = torch.bfloat16
+    print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
 else:
-    # Fallback to standard PyTorch/transformers approach
-    print(f"Loading base model with standard approach: {BASE_MODEL_NAME_FOR_FINETUNING}")
-    
-    # Determine optimal dtype
-    if is_bfloat16_supported():
-        dtype = torch.bfloat16
-        print("[STANDARD] Using bfloat16 (optimal for modern GPUs)")
-    else:
-        dtype = torch.float16
-        print("[STANDARD] Using float16 (fallback for older GPUs)")
+    dtype = torch.float16
+    print("[STANDARD] Using float16 (fallback for older GPUs)")
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING,
-        torch_dtype=dtype,
-        device_map="auto",
-        trust_remote_code=True
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME_FOR_FINETUNING,
+    torch_dtype=dtype,
+    device_map="auto",
+    trust_remote_code=True,
+    quantization_config=bnb_config,
+)
+
+# Load tokenizer
+tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
+if tokenizer_for_training.pad_token is None:
+    tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
+if tokenizer_for_training.padding_side == 'right':
+    tokenizer_for_training.padding_side = 'left'
+
+# Load previous LoRA checkpoint or create fresh LoRA
+if LOAD_FROM_CHECKPOINT:
+    print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
+    try:
+        model_peft = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
+        print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
+        
+        # CRITICAL: Enable gradients for LoRA parameters after loading checkpoint
+        for name, param in model_peft.named_parameters():
+            if 'lora_' in name.lower():
+                param.requires_grad = True
+        print("[FIX] Enabled gradients for LoRA parameters")
+        
+    except Exception as e:
+        print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
+        LOAD_FROM_CHECKPOINT = False  # Force fresh creation
+        
+if not LOAD_FROM_CHECKPOINT:
+    print("Creating fresh LoRA configuration...")
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16, 
+        lora_alpha=32, 
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none"
     )
-
-    # Load tokenizer
-    tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
-
-    # Load previous LoRA checkpoint or create fresh LoRA
-    if LOAD_FROM_CHECKPOINT:
-        print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
-        try:
-            model_peft = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
-            print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
-            
-            # CRITICAL: Enable gradients for LoRA parameters after loading checkpoint
-            for name, param in model_peft.named_parameters():
-                if 'lora_' in name.lower():
-                    param.requires_grad = True
-            print("[FIX] Enabled gradients for LoRA parameters")
-            
-        except Exception as e:
-            print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
-            LOAD_FROM_CHECKPOINT = False  # Force fresh creation
-            
-    if not LOAD_FROM_CHECKPOINT:
-        print("Creating fresh LoRA configuration...")
-        lora_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=16, 
-            lora_alpha=32, 
-            lora_dropout=0.05,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            bias="none"
-        )
-        model_peft = get_peft_model(base_model, lora_config)
+    model_peft = get_peft_model(base_model, lora_config)
+    
+    # Immediately enable training mode and check gradients
+    model_peft.train()
+    print("[PEFT SETUP] Enabling gradients for all LoRA parameters...")
+    for name, param in model_peft.named_parameters():
+        if 'lora_' in name.lower():
+            param.requires_grad = True
+            print(f"[PEFT SETUP] Enabled: {name}")
+    
+    # Verify PEFT setup
+    trainable_count = sum(1 for p in model_peft.parameters() if p.requires_grad)
+    print(f"[PEFT SETUP] {trainable_count} trainable parameters after PEFT setup")
 
 # Configure gradient checkpointing and training mode
-if UNSLOTH_AVAILABLE:
-    print("[UNSLOTH] Gradient checkpointing optimized automatically")
-    FastLanguageModel.for_training(model_peft)  # Enable training mode with Unsloth optimizations
-else:
-    print("[STANDARD] Using standard training mode")
-    model_peft.train()
+print("[STANDARD] Using standard training mode")
+model_peft.train()
+
+# CRITICAL: Ensure all trainable parameters have gradients enabled
+trainable_params_count = 0
+for name, param in model_peft.named_parameters():
+    if param.requires_grad:
+        trainable_params_count += 1
+    else:
+        # Force enable gradients for PEFT parameters
+        if any(target in name for target in ["lora_", "modules_to_save"]):
+            param.requires_grad = True
+            trainable_params_count += 1
+            print(f"[FIX] Enabled gradients for: {name}")
+
+print(f"[GRADIENT CHECK] {trainable_params_count} parameters have gradients enabled")
+
+# Verify gradients are properly enabled
+if trainable_params_count == 0:
+    print("[ERROR] No parameters have gradients enabled!")
+    # Force enable gradients for all LoRA parameters
+    for name, param in model_peft.named_parameters():
+        if 'lora_' in name.lower():
+            param.requires_grad = True
+            print(f"[FORCE FIX] Enabled gradients for: {name}")
 
 model_peft.print_trainable_parameters()
 
@@ -488,6 +595,13 @@ from torch.optim import AdamW
 # Get only trainable parameters for the optimizer
 trainable_params_for_optimizer = [param for param in model_peft.parameters() if param.requires_grad]
 print(f"[OPTIMIZER] Creating optimizer with {len(trainable_params_for_optimizer)} trainable parameter groups")
+
+if len(trainable_params_for_optimizer) == 0:
+    print("[ERROR] No trainable parameters found for optimizer!")
+    print("[DEBUG] All model parameters:")
+    for name, param in model_peft.named_parameters():
+        print(f"  {name}: requires_grad={param.requires_grad}")
+    raise ValueError("No trainable parameters found")
 
 optimizer = AdamW(
     trainable_params_for_optimizer,
@@ -501,6 +615,11 @@ print(f"[SUCCESS] Created fresh AdamW optimizer with lr={NEW_LEARNING_RATE}")
 optimizer_param_count = sum(p.numel() for group in optimizer.param_groups for p in group['params'])
 print(f"[OPTIMIZER CHECK] Optimizer managing {optimizer_param_count:,} parameters")
 
+# Additional safety check for gradient computation
+print("[GRADIENT TEST] Testing gradient computation...")
+test_params_with_grad = sum(1 for p in model_peft.parameters() if p.requires_grad)
+print(f"[GRADIENT TEST] Found {test_params_with_grad} parameters with requires_grad=True")
+
 # Reset value head parameters if it exists
 try:
     if hasattr(model_peft, 'v_head') and model_peft.v_head is not None:
@@ -511,33 +630,22 @@ try:
 except Exception as e:
     print(f"[WARNING] Could not reset value head: {e}")
 
-# Configure tokenizer for training
-if not UNSLOTH_AVAILABLE:  # Unsloth handles this automatically
-    tokenizer_for_training = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
-    if tokenizer_for_training.pad_token is None:
-        tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
-    if tokenizer_for_training.padding_side == 'right':
-        tokenizer_for_training.padding_side = 'left'
+# Configure tokenizer for training (already done above in model loading section)
 
 model_peft.config.pad_token_id = tokenizer_for_training.eos_token_id
 
 # --- 6. Reward Function for GRPO with L2 Distance Based Scoring ---
-_num_generations_per_prompt_for_reward = 2
+_num_generations_per_prompt_for_reward = 4
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
-# New reward hyperparameters
-CORRECT_7_MULT_BONUS = 5.0  # +5 for correct 7 multiplication solutions
-NEAR_MISS_PENALTY = -15.0   # -1 for near-miss (8×, ≤6×) 
-WEIRD_ANSWER_PENALTY = -20.0   # -10 for weird/incorrect answers
-TAG_BONUS = 0.1  # +0.1 for DSL tags
+# Simple reward hyperparameters
+TAG_BONUS = 0.1          # +0.1 for DSL tags
+MULT_PENALTY = -1.0      # -1 for each multiplication
+WRONG_ANSWER_PENALTY = -100.0  # -100 for wrong answers
 
-# Exploration formula: -1.06×10^-8 * ||AB-C||^2 + 6
-# Ranges ≈[-11, 6], so best exploration > correct (5), worst < weird (-10)
-EXPLORATION_SCALE = -10.0 / 1.59936e17
-# print(exploration_scale)  # → approximately -6.252006252006252e-17
-  # Scale factor for L2 squared distance
-EXPLORATION_OFFSET = 6.0      # Offset to ensure best exploration > correct answers
+# Alias for backward compatibility (avoid NameError in any leftover references)
+WEIRD_ANSWER_PENALTY = WRONG_ANSWER_PENALTY
 
 # Discovery logging setup
 timestamp_for_discoveries = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -566,7 +674,7 @@ def log_discovery(message, dsl_script=None):
 
 # Initialize discovery log
 log_discovery(f"DISCOVERY LOG STARTED - Training Session {timestamp_for_discoveries}")
-log_discovery(f"Exploration-Prioritized Scoring: -1.06e-8*||AB-C||²+6 for exploration (capped at -4 for 7-mult), +5 for correct 7-mult, -15 for near-miss, -10 for weird answers, +0.1 for DSL tags, min -19 for solvable DSL")
+log_discovery(f"Simple Scoring: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers")
 
 def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     global _num_generations_per_prompt_for_reward, _reward_call_count, _best_n_mults
@@ -657,70 +765,35 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
         reward = 0.0
         
         try:
-            # Count multiplications
-            for line in final_dsl_script.split('\n'):
-                if re.search(r"=\s*[\w\[\],\s\.\d\-]+\s*\*\s*[\w\[\],\s\.\d\-]+", line.strip()):
-                    num_multiplications += 1
+            # Count multiplications more accurately
+            num_multiplications = count_multiplications_in_dsl(final_dsl_script)
             
             # Execute DSL
             executor = DSLExecutor(A, B)
             C_dsl = executor.run_dsl_and_get_c(final_dsl_script)
 
-            # NEW EXPLORATION-PRIORITIZED SCORING SYSTEM
-            # Calculate L2 squared distance for all cases
-            l2_sq_distance = 0.0
-            for r in range(2):
-                for c in range(2):
-                    diff = C_dsl[r][c] - expected_C[r][c]
-                    l2_sq_distance += diff * diff
-            
-            if num_multiplications == 7:
-                # PRIORITIZED: 7-multiplication solutions get exploration formula with L2 distance capped at max -10
-                # Formula: -1.06×10^-8 * ||AB-C||^2 + 6, but capped at minimum of -4 (6 - 10)
-                base_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
-                reward = max(base_reward, EXPLORATION_OFFSET - 10.0)  # Cap L2 penalty at max -10
-                
-                if C_dsl == expected_C:
-                    print(f"  Completion {i}: **PERFECT** Correct 7-multiplication solution! (L2²={l2_sq_distance:.0f}, reward={reward:.3f})")
-                    
-                    # Log the perfect solution
-                    log_discovery(f"PERFECT 7-MULT SOLUTION! Score: {reward:.3f}", final_dsl_script)
-                    log_discovery(f"Test matrices: A={A}, B={B}, Expected C={expected_C}")
-                    
-                    if num_multiplications < _best_n_mults:
-                        _best_n_mults = num_multiplications
-                else:
-                    print(f"  Completion {i}: **7-MULT EXPLORATION** L2²={l2_sq_distance:.0f}, reward={reward:.3f} (capped)")
-                    print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
-                    
-            elif C_dsl == expected_C:
-                # CORRECT DSL but not 7-multiplication - use fixed penalty for near-miss
-                reward = NEAR_MISS_PENALTY  # -15 for near-miss (correct but not 7-mult)
-                print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult (near-miss penalty: {NEAR_MISS_PENALTY})")
+            # SIMPLE SCORING SYSTEM
+            if C_dsl == expected_C:
+                # Correct answer: penalty only for number of multiplications
+                reward = num_multiplications * MULT_PENALTY  # -1 per multiplication
+                print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 
                 if num_multiplications < _best_n_mults:
                     _best_n_mults = num_multiplications
                     log_discovery(f"NEW BEST SOLUTION! {num_multiplications} multiplications", final_dsl_script)
+                    log_discovery(f"Test matrices: A={A}, B={B}, Expected C={expected_C}")
                     
             else:
-                # INCORRECT non-7-multiplication solutions - use exploration formula but ensure lower priority
-                base_exploration_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
-                
-                # Ensure non-7-mult incorrect solutions are always worse than weird answers threshold
-                # by capping them at slightly above weird answer penalty
-                reward = min(base_exploration_reward, WEIRD_ANSWER_PENALTY + 1.0)
-                
-                print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mul attempt. L2²={l2_sq_distance:.0f}, reward={reward:.3f}")
+                # Wrong answer: large penalty
+                reward = WRONG_ANSWER_PENALTY  # -100
+                print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
-            
-            # Ensure no solvable DSL gets reward less than -19
-            reward = max(reward, -19.0)
 
         except Exception as e:
-            # FAILED EXECUTION - weird answer penalty
-            reward = WEIRD_ANSWER_PENALTY
+            # FAILED EXECUTION - wrong answer penalty
+            reward = WRONG_ANSWER_PENALTY  # -100
             print(f"  Completion {i}: **EXECUTION FAILED**: {str(e)[:100]}...")
-            print(f"  Completion {i}: Weird answer penalty: {reward:.1f}")
+            print(f"  Completion {i}: Wrong answer penalty: {reward:.1f}")
         
         # Final reward with tag bonus
         final_reward = reward + tag_bonus
@@ -737,8 +810,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     return rewards
 
 # --- 7. Training Arguments and GRPOTrainer ---
-print("Configuring training arguments for GRPO with optimizations...")
-# Unsloth automatically handles optimal precision settings
+print("Configuring training arguments for GRPO...")
 use_bf16 = is_bfloat16_supported()  # Automatic detection
 use_fp16 = not use_bf16
 
@@ -759,10 +831,10 @@ training_args_grpo = GRPOConfig(
     bf16=use_bf16, 
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE,
-    # ULTRA-CONSERVATIVE MEMORY SETTINGS FOR COLAB GRPO (2 generations per prompt)
-    max_completion_length=2000,  # REDUCED to prevent hanging on first batch
+    # Training configuration settings
+    max_completion_length=512,
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=400,       # REDUCED for Colab memory constraints
+    max_prompt_length=256,
     logging_steps=5,
     save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
     save_steps=100,  # Save checkpoint every 100 steps
@@ -770,19 +842,19 @@ training_args_grpo = GRPOConfig(
     report_to="tensorboard",
     push_to_hub=False,
     dataloader_drop_last=True,  # Changed to True to ensure consistent batches
-    warmup_steps=2,  # MINIMAL warmup to reduce initial batch load
-    # Data loading configuration for Colab stability
-    dataloader_num_workers=0,  # Disable multiprocessing to avoid batch issues
-    dataloader_prefetch_factor=None,  # Disable prefetching
+    warmup_steps=2,
+    # Data loading configuration
+    dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     # Memory optimization settings
-    gradient_checkpointing=True,
-    max_grad_norm=0.5,  # REDUCED for stability
-    warmup_ratio=0.05,  # REDUCED warmup ratio
-    # Additional GRPO memory optimizations for Colab
-    group_by_length=False,            # Disable grouping to reduce memory fragmentation
-    dataloader_pin_memory=False,      # Disable pin memory for stability
-    ddp_find_unused_parameters=False, # Disable unused parameter detection
-    torch_compile=False,              # Disable torch compile for stability
+    gradient_checkpointing=False,  # Disabled to avoid gradient issues with PEFT
+    max_grad_norm=0.5,
+    warmup_ratio=0.05,
+    # Additional GRPO settings
+    group_by_length=False,
+    dataloader_pin_memory=False,
+    ddp_find_unused_parameters=False,
+    torch_compile=False,
 )
 
 model_peft.config.pad_token_id = tokenizer_for_training.pad_token_id
@@ -822,10 +894,7 @@ print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
 print(f"  - Max completion length: {training_args_grpo.max_completion_length}")
 print(f"  - Max prompt length: {training_args_grpo.max_prompt_length}")
 print(f"  - Generations per prompt: {_num_generations_per_prompt_for_reward}")
-if UNSLOTH_AVAILABLE:
-    print(f"  - Mode: Unsloth optimized (2x faster, 50% memory reduction)")
-else:
-    print(f"  - Mode: Standard PyTorch training")
+print(f"  - Mode: Standard PyTorch training")
 print(f"TensorBoard logs will be saved locally in: {actual_tensorboard_dir}")
 if USE_DRIVE_FOR_SAVING and DRIVE_TENSORBOARD_PATH:
     print(f"Logs will be copied to Drive after training: {DRIVE_TENSORBOARD_PATH}")
@@ -860,6 +929,13 @@ print(f"  First sample A matrix: {train_dataset_for_grpo[0]['A_matrix_str']}")
 torch.cuda.empty_cache()
 print("Cleared CUDA cache before training")
 
+print("\n=== PRE-TRAINING FINAL CHECKS ===")
+# Minimal gradient sanity-check (no dummy forward pass)
+trainable_exists = any(p.requires_grad for p in model_peft.parameters())
+if not trainable_exists:
+    raise ValueError("No trainable parameters have gradients enabled.")
+print("[FINAL CHECK] Gradient flags verified (✓)")
+
 print("\n=== STARTING GRPO TRAINING ===")
 print("If training hangs on 'Loading data', it's likely a memory issue...")
 
@@ -875,6 +951,7 @@ except Exception as e:
 # Log final discovery summary
 final_best = _best_n_mults if _best_n_mults != float('inf') else 'None found'
 log_discovery(f"TRAINING COMPLETED - Final best: {final_best} multiplications")
+log_discovery(f"Simple reward system: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers")
 log_discovery(f"Discoveries log saved to: {DISCOVERIES_LOG_FILE}")
 if DISCOVERIES_DRIVE_FILE:
     log_discovery(f"Discoveries log copied to Drive: {DISCOVERIES_DRIVE_FILE}")
@@ -1036,6 +1113,52 @@ else:
         print(f"[FAILED] Invalid DSL or execution error: {e}")
     except Exception as e: 
         print(f"[FAILED] Unexpected verification error: {e}")
+
+print("\n--- Testing Enhanced DSL with Chained Operations ---")
+# Test the enhanced DSL executor with the user's example
+test_dsl_example = """M1 = (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
+M2 = (A[1,0] + A[0,1]) * (B[0,1])
+M3 = A[1,1] * (B[0,0] - B[1,1])
+M4 = A[0,0] * (B[1,1] + B[0,0])
+M5 = (A[0,1] + A[1,1]) * (B[0,0])
+M6 = (A[1,0] - A[0,0]) * (B[1,0] - B[0,1])
+M7 = (A[0,0] + A[1,0]) * (B[0,1] - B[1,1])
+
+C[0,0] = M2 + M3 - M5 + M6
+C[0,1] = M1 + M6 - M4
+C[1,0] = M7 - M2 + M1
+C[1,1] = M3 - M4 + M5 - M7"""
+
+print("Testing DSL example with chained operations:")
+print(f"Input DSL:\n{test_dsl_example}")
+
+try:
+    # Test multiplication counting
+    mult_count = count_multiplications_in_dsl(test_dsl_example)
+    print(f"\n[MULT COUNT] Found {mult_count} multiplications (expected: 7)")
+    
+    # Test DSL execution
+    test_executor = DSLExecutor(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
+    test_result = test_executor.run_dsl_and_get_c(test_dsl_example)
+    expected_result = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
+    
+    print(f"\n[DSL TEST] Test matrices: A={A_INFERENCE_MATRIX}, B={B_INFERENCE_MATRIX}")
+    print(f"[DSL TEST] Expected result: {expected_result}")
+    print(f"[DSL TEST] DSL result:      {test_result}")
+    
+    if test_result == expected_result:
+        print(f"[DSL TEST] ✓ Enhanced DSL executor works correctly!")
+        print(f"[DSL TEST] ✓ Chained operations (M2 + M3 - M5 + M6) handled properly")
+        print(f"[DSL TEST] ✓ Parenthetical expressions parsed correctly")
+        if mult_count == 7:
+            print(f"[DSL TEST] ✓ Multiplication counting is accurate (7/7)")
+        else:
+            print(f"[DSL TEST] ⚠ Multiplication count discrepancy: got {mult_count}, expected 7")
+    else:
+        print(f"[DSL TEST] ✗ DSL execution failed - results don't match")
+        
+except Exception as e:
+    print(f"[DSL TEST] ✗ Error testing enhanced DSL: {e}")
 
 print(f"\n*** SCRIPT COMPLETED SUCCESSFULLY ***")
 print(f"[SAVED] Model saved to: {DRIVE_TRAINED_MODEL_PATH if USE_DRIVE_FOR_SAVING else LOCAL_TRAINED_MODEL_PATH}")

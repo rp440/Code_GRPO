@@ -117,14 +117,39 @@ class DSLExecutor:
         self.variables[target_var] = result
     
     def _evaluate_expression(self, expression, original_step_line):
-        """Evaluate an expression that may contain chained +/- operations"""
+        """Evaluate an expression that may contain chained +/- operations or complex parenthetical expressions"""
         expression = expression.strip()
         
         # Simple assignment (no operators) - check for variable names or numbers only
-        # Must be: variable name, matrix element, or number (no spaces around operators)
         assign_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
         if assign_match:
             return self._get_value(assign_match.group(1).strip())
+        
+        # Handle parenthetical expressions first - simple cases like (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
+        paren_mult_match = re.match(r"^\s*\(([^)]+)\)\s*\*\s*\(([^)]+)\)\s*$", expression)
+        if paren_mult_match:
+            left_expr = paren_mult_match.group(1).strip()
+            right_expr = paren_mult_match.group(2).strip()
+            left_val = self._evaluate_simple_expression(left_expr)
+            right_val = self._evaluate_simple_expression(right_expr)
+            return left_val * right_val
+        
+        # Handle expression * variable or variable * expression cases
+        mult_var_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?)\s*\*\s*\(([^)]+)\)\s*$", expression)
+        if mult_var_match:
+            var_name = mult_var_match.group(1).strip()
+            expr = mult_var_match.group(2).strip()
+            var_val = self._get_value(var_name)
+            expr_val = self._evaluate_simple_expression(expr)
+            return var_val * expr_val
+            
+        var_mult_match = re.match(r"^\s*\(([^)]+)\)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?)\s*$", expression)
+        if var_mult_match:
+            expr = var_mult_match.group(1).strip()
+            var_name = var_mult_match.group(2).strip()
+            expr_val = self._evaluate_simple_expression(expr)
+            var_val = self._get_value(var_name)
+            return expr_val * var_val
         
         # Single binary operation (backward compatibility)
         binary_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*([*+-])\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?|\-?\d+(?:\.\d+)?)\s*$", expression)
@@ -139,8 +164,53 @@ class DSLExecutor:
             elif operator == '-': return val1 - val2
             else: raise ValueError(f"Unsupported operator '{operator}' in expression: '{expression}'")
         
-        # Chained operations (e.g., M1 + M4 - M5 + M7)
-        # Split by + and - while preserving operators, but be careful with negative numbers
+        # Chained operations (e.g., M2 + M3 - M5 + M6)
+        return self._evaluate_chained_expression(expression, original_step_line)
+    
+    def _evaluate_simple_expression(self, expression):
+        """Evaluate simple expressions within parentheses (addition/subtraction only)"""
+        expression = expression.strip()
+        
+        # Single variable or number
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?$|^\-?\d+(?:\.\d+)?$", expression):
+            return self._get_value(expression)
+        
+        # Split by + and - operators
+        tokens = re.split(r'(\s*[+-]\s*)', expression)
+        if len(tokens) == 1:
+            return self._get_value(expression.strip())
+        
+        # First term
+        result = self._get_value(tokens[0].strip())
+        
+        # Process remaining terms
+        i = 1
+        while i < len(tokens):
+            if i + 1 >= len(tokens):
+                break
+            operator = tokens[i].strip()
+            operand = tokens[i + 1].strip()
+            
+            if not operator or not operand:
+                i += 2
+                continue
+                
+            value = self._get_value(operand)
+            
+            if operator == '+': 
+                result += value
+            elif operator == '-': 
+                result -= value
+            else: 
+                raise ValueError(f"Unsupported operator '{operator}' in simple expression: '{expression}'")
+            
+            i += 2
+        
+        return result
+    
+    def _evaluate_chained_expression(self, expression, original_step_line):
+        """Evaluate chained +/- operations like M2 + M3 - M5 + M6"""
+        # Split by + and - while preserving operators
         tokens = re.split(r'(\s*[+-]\s*)', expression)
         if len(tokens) == 1:
             raise ValueError(f"Malformed expression: '{expression}' in DSL line: '{original_step_line}'")
@@ -164,9 +234,12 @@ class DSLExecutor:
                 
             value = self._get_value(operand)
             
-            if operator == '+': result += value
-            elif operator == '-': result -= value
-            else: raise ValueError(f"Unsupported operator '{operator}' in chained expression: '{expression}'")
+            if operator == '+': 
+                result += value
+            elif operator == '-': 
+                result -= value
+            else: 
+                raise ValueError(f"Unsupported operator '{operator}' in chained expression: '{expression}'")
             
             i += 2
         
@@ -196,6 +269,37 @@ def manual_matrix_multiply_2x2(A, B):
     C[1][1] = A[1][0] * B[0][1] + A[1][1] * B[1][1]
     return C
 
+def count_multiplications_in_dsl(dsl_script):
+    """
+    Count ALL multiplication operations (*) in a DSL script.
+    Simple and reliable: counts every '*' operator in assignment lines.
+    """
+    count = 0
+    lines = dsl_script.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line or '=' not in line:
+            continue
+            
+        # Split at = to get the expression part only (right side of assignment)
+        parts = line.split('=', 1)
+        if len(parts) != 2:
+            continue
+            
+        expression = parts[1].strip()
+        
+        # Count ALL '*' operators in the expression
+        # This is simple and reliable - every '*' is a multiplication operation
+        line_mult_count = expression.count('*')
+        count += line_mult_count
+        
+        if line_mult_count > 0:
+            print(f"[MULT COUNT] Line '{line.strip()}' has {line_mult_count} multiplication(s)")
+            
+    print(f"[MULT COUNT TOTAL] Found {count} total multiplications in DSL script")
+    return count
+
 def _generate_random_2x2_matrix_for_inference(low=-99, high=99):
     return [[random.randint(low, high) for _ in range(2)] for _ in range(2)]
 
@@ -204,8 +308,7 @@ B_INFERENCE_MATRIX = _generate_random_2x2_matrix_for_inference()
 C_EXPECTED_INFERENCE_RESULT = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
 
 # --- 3. GRPO Configuration and System Prompt ---
-BASE_MODEL_NAME_FOR_FINETUNING = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-# Using 8-bit quantized model for efficient GRPO training
+BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2-1.5B"
 
 
 TRAINED_MODEL_DIR_NAME = f"{BASE_MODEL_NAME_FOR_FINETUNING.split('/')[-1]}-GRPO-MatMulDSL-JSONL"
@@ -224,17 +327,17 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 8   # Reduced batch size for 4k context and 8-bit quantization
-    GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps
+    BATCH_SIZE_PER_GPU = 4   # Matching GPRO_matmul.py configuration
+    GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[CONFIG] Using 8-bit quantization with 4k context length")
+    print(f"[CONFIG] Using 4-bit quantization configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4   # Reduced batch size for 4k context and 8-bit quantization
-    GRAD_ACC_STEPS = 2       # Keep moderate accumulation steps  
+    BATCH_SIZE_PER_GPU = 4   # Matching GPRO_matmul.py configuration
+    GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
     print(f"[CONFIG] Single GPU mode")
-    print(f"[CONFIG] Using 8-bit quantization with 4k context length")
+    print(f"[CONFIG] Using 4-bit quantization configuration")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
@@ -254,7 +357,7 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
 print(f"[GPU CONFIG] Using {NUM_GPUS} GPU(s) with {BATCH_SIZE_PER_GPU} batch size per GPU")
-print(f"[TRAINING CONFIG] Context length: 4000 tokens")
+print(f"[TRAINING CONFIG] Max completion length: 512 tokens, Max prompt length: 256 tokens")
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
@@ -276,8 +379,8 @@ C[1,1] = M3 - M4 + M5 - M7
 
 This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.  YOUR TASK: Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags. 
 DSL SYNTAX RULES: - M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0]) - S variables:
- Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
-  REQUIREMENTS: - Use ≤7 multiplications total within the <DSL></DSL> tags - Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1] - Wrap DSL code in <DSL></DSL> tags - You may add explanations outside the tags  If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
+Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
+REQUIREMENTS: - Use ≤7 multiplications total within the <DSL></DSL> tags - Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1] - Wrap DSL code in <DSL></DSL> tags - You may add explanations outside the tags  If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
 
 DEFAULT_USER_PROMPT_FOR_DSL_GENERATION = "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications.First think about answer then respond in <DSL></DSL> tags."
 
@@ -400,19 +503,20 @@ else:
     device_map = "auto"
     print("[SINGLE GPU] Loading model with device_map='auto'")
 
-# Load model using standard transformers approach with 8-bit quantization
-quantization_config = BitsAndBytesConfig(
-    load_in_8bit=True,  # Using 8-bit quantization instead of 4-bit
-    llm_int8_threshold=6.0,
-    llm_int8_has_fp16_weight=False,
+# Load model using standard transformers approach with 4-bit quantization
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
 )
 
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_NAME_FOR_FINETUNING,
-    quantization_config=quantization_config,
     torch_dtype=dtype,
     device_map=device_map,
     trust_remote_code=True,
+    quantization_config=bnb_config,
 )
 
 tokenizer_for_training = AutoTokenizer.from_pretrained(
@@ -512,16 +616,13 @@ _num_generations_per_prompt_for_reward = 4  # MUST be >= 2 for GRPO to work effe
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
-# New reward hyperparameters
-CORRECT_7_MULT_BONUS = 5.0  # +5 for correct 7 multiplication solutions
-NEAR_MISS_PENALTY = -15.0   # -1 for near-miss (8×, ≤6×) 
-WEIRD_ANSWER_PENALTY = -20.0   # -10 for weird/incorrect answers
-TAG_BONUS = 0.1  # +0.1 for DSL tags
+# Simple reward hyperparameters
+TAG_BONUS = 0.1          # +0.1 for DSL tags
+MULT_PENALTY = -1.0      # -1 for each multiplication
+WRONG_ANSWER_PENALTY = -100.0  # -100 for wrong answers
 
-# Exploration formula: -1.06×10^-8 * ||AB-C||^2 + 6
-# Ranges ≈[-11, 6], so best exploration > correct (5), worst < weird (-10)
-EXPLORATION_SCALE = -10.0 / 1.59936e17
-EXPLORATION_OFFSET = 6.0      # Offset to ensure best exploration > correct answers
+# Alias for backward compatibility (avoid NameError in any leftover references)
+WEIRD_ANSWER_PENALTY = WRONG_ANSWER_PENALTY
 
 # Discovery logging setup
 timestamp_for_discoveries = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -541,7 +642,7 @@ def log_discovery(message, dsl_script=None):
 
 # Initialize discovery log
 log_discovery(f"DISCOVERY LOG STARTED - Training Session {timestamp_for_discoveries}")
-log_discovery(f"Exploration-Prioritized Scoring: -1.06e-8*||AB-C||²+6 for exploration (capped at -4 for 7-mult), +5 for correct 7-mult, -15 for near-miss, -10 for weird answers, +0.1 for DSL tags, min -19 for solvable DSL")
+log_discovery(f"Simple Scoring: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers")
 
 def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     global _num_generations_per_prompt_for_reward, _reward_call_count, _best_n_mults
@@ -674,70 +775,35 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
         reward = 0.0
         
         try:
-            # Count multiplications
-            for line in final_dsl_script.split('\n'):
-                if re.search(r"=\s*[\w\[\],\s\.\d\-]+\s*\*\s*[\w\[\],\s\.\d\-]+", line.strip()):
-                    num_multiplications += 1
+            # Count multiplications more accurately
+            num_multiplications = count_multiplications_in_dsl(final_dsl_script)
             
             # Execute DSL
             executor = DSLExecutor(A, B)
             C_dsl = executor.run_dsl_and_get_c(final_dsl_script)
 
-            # NEW EXPLORATION-PRIORITIZED SCORING SYSTEM
-            # Calculate L2 squared distance for all cases
-            l2_sq_distance = 0.0
-            for r in range(2):
-                for c in range(2):
-                    diff = C_dsl[r][c] - expected_C[r][c]
-                    l2_sq_distance += diff * diff
-            
-            if num_multiplications == 7:
-                # PRIORITIZED: 7-multiplication solutions get exploration formula with L2 distance capped at max -10
-                # Formula: -1.06×10^-8 * ||AB-C||^2 + 6, but capped at minimum of -4 (6 - 10)
-                base_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
-                reward = max(base_reward, EXPLORATION_OFFSET - 10.0)  # Cap L2 penalty at max -10
-                
-                if C_dsl == expected_C:
-                    print(f"  Completion {i}: **PERFECT** Correct 7-multiplication solution! (L2²={l2_sq_distance:.0f}, reward={reward:.3f})")
-                    
-                    # Log the perfect solution
-                    log_discovery(f"PERFECT 7-MULT SOLUTION! Score: {reward:.3f}", final_dsl_script)
-                    log_discovery(f"Test matrices: A={A}, B={B}, Expected C={expected_C}")
-                    
-                    if num_multiplications < _best_n_mults:
-                        _best_n_mults = num_multiplications
-                else:
-                    print(f"  Completion {i}: **7-MULT EXPLORATION** L2²={l2_sq_distance:.0f}, reward={reward:.3f} (capped)")
-                    print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
-                    
-            elif C_dsl == expected_C:
-                # CORRECT DSL but not 7-multiplication - use fixed penalty for near-miss
-                reward = NEAR_MISS_PENALTY  # -15 for near-miss (correct but not 7-mult)
-                print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult (near-miss penalty: {NEAR_MISS_PENALTY})")
+            # SIMPLE SCORING SYSTEM
+            if C_dsl == expected_C:
+                # Correct answer: penalty only for number of multiplications
+                reward = num_multiplications * MULT_PENALTY  # -1 per multiplication
+                print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 
                 if num_multiplications < _best_n_mults:
                     _best_n_mults = num_multiplications
                     log_discovery(f"NEW BEST SOLUTION! {num_multiplications} multiplications", final_dsl_script)
+                    log_discovery(f"Test matrices: A={A}, B={B}, Expected C={expected_C}")
                     
             else:
-                # INCORRECT non-7-multiplication solutions - use exploration formula but ensure lower priority
-                base_exploration_reward = EXPLORATION_SCALE * l2_sq_distance + EXPLORATION_OFFSET
-                
-                # Ensure non-7-mult incorrect solutions are always worse than weird answers threshold
-                # by capping them at slightly above weird answer penalty
-                reward = min(base_exploration_reward, WEIRD_ANSWER_PENALTY + 1.0)
-                
-                print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mul attempt. L2²={l2_sq_distance:.0f}, reward={reward:.3f}")
+                # Wrong answer: large penalty
+                reward = WRONG_ANSWER_PENALTY  # -100
+                print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
-            
-            # Ensure no solvable DSL gets reward less than -19
-            reward = max(reward, -19.0)
 
         except Exception as e:
-            # FAILED EXECUTION - weird answer penalty
-            reward = WEIRD_ANSWER_PENALTY
+            # FAILED EXECUTION - wrong answer penalty
+            reward = WRONG_ANSWER_PENALTY  # -100
             print(f"  Completion {i}: **EXECUTION FAILED**: {str(e)[:100]}...")
-            print(f"  Completion {i}: Weird answer penalty: {reward:.1f}")
+            print(f"  Completion {i}: Wrong answer penalty: {reward:.1f}")
         
         # Final reward with tag bonus
         final_reward = reward + tag_bonus
@@ -832,15 +898,15 @@ training_args_grpo = GRPOConfig(
     learning_rate=NEW_LEARNING_RATE,
     remove_unused_columns=False,
     gradient_accumulation_steps=GRAD_ACC_STEPS,
-    use_vllm                    = False,  # Disable vLLM for standard model compatibility
+    use_vllm=False,  # Disable vLLM for standard model compatibility
     num_train_epochs=EPOCHS,
     bf16=use_bf16,
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
-    # MEMORY OPTIMIZATION FOR GRPO (2 generations per prompt) - 4k context length
-    max_completion_length=2000,  # 4k context length
+    # Training configuration settings
+    max_completion_length=512,
     num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=600,        # Reduced proportionally with completion length
+    max_prompt_length=256,
     logging_steps=5,
     save_strategy="steps",
     save_steps=100,
@@ -938,6 +1004,7 @@ print("GRPO Training finished.")
 # Log final discovery summary
 final_best = _best_n_mults if _best_n_mults != float('inf') else 'None found'
 log_discovery(f"TRAINING COMPLETED - Final best: {final_best} multiplications")
+log_discovery(f"Simple reward system: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers")
 log_discovery(f"Discoveries log saved to: {DISCOVERIES_LOG_FILE}")
 
 # --- 9. Save Model ---
@@ -1055,6 +1122,52 @@ else:
     except Exception as e: 
         print(f"[FAILED] Unexpected verification error: {e}")
 
+print("\n--- Testing Enhanced DSL with Chained Operations ---")
+# Test the enhanced DSL executor with the user's example
+test_dsl_example = """M1 = (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
+M2 = (A[1,0] + A[0,1]) * (B[0,1])
+M3 = A[1,1] * (B[0,0] - B[1,1])
+M4 = A[0,0] * (B[1,1] + B[0,0])
+M5 = (A[0,1] + A[1,1]) * (B[0,0])
+M6 = (A[1,0] - A[0,0]) * (B[1,0] - B[0,1])
+M7 = (A[0,0] + A[1,0]) * (B[0,1] - B[1,1])
+
+C[0,0] = M2 + M3 - M5 + M6
+C[0,1] = M1 + M6 - M4
+C[1,0] = M7 - M2 + M1
+C[1,1] = M3 - M4 + M5 - M7"""
+
+print("Testing DSL example with chained operations:")
+print(f"Input DSL:\n{test_dsl_example}")
+
+try:
+    # Test multiplication counting
+    mult_count = count_multiplications_in_dsl(test_dsl_example)
+    print(f"\n[MULT COUNT] Found {mult_count} multiplications (expected: 7)")
+    
+    # Test DSL execution
+    test_executor = DSLExecutor(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
+    test_result = test_executor.run_dsl_and_get_c(test_dsl_example)
+    expected_result = manual_matrix_multiply_2x2(A_INFERENCE_MATRIX, B_INFERENCE_MATRIX)
+    
+    print(f"\n[DSL TEST] Test matrices: A={A_INFERENCE_MATRIX}, B={B_INFERENCE_MATRIX}")
+    print(f"[DSL TEST] Expected result: {expected_result}")
+    print(f"[DSL TEST] DSL result:      {test_result}")
+    
+    if test_result == expected_result:
+        print(f"[DSL TEST] ✓ Enhanced DSL executor works correctly!")
+        print(f"[DSL TEST] ✓ Chained operations (M2 + M3 - M5 + M6) handled properly")
+        print(f"[DSL TEST] ✓ Parenthetical expressions parsed correctly")
+        if mult_count == 7:
+            print(f"[DSL TEST] ✓ Multiplication counting is accurate (7/7)")
+        else:
+            print(f"[DSL TEST] ⚠ Multiplication count discrepancy: got {mult_count}, expected 7")
+    else:
+        print(f"[DSL TEST] ✗ DSL execution failed - results don't match")
+        
+except Exception as e:
+    print(f"[DSL TEST] ✗ Error testing enhanced DSL: {e}")
+
 print(f"\n*** SCRIPT COMPLETED SUCCESSFULLY ***")
 print(f"[SAVED] Model saved to: {FINAL_MODEL_PATH}")
 print(f"[LOGS] TensorBoard logs: {FINAL_TENSORBOARD_PATH}")
@@ -1062,4 +1175,4 @@ print(f"[DISCOVERIES] Log: {DISCOVERIES_LOG_FILE}")
 final_best_summary = _best_n_mults if _best_n_mults != float('inf') else 'None found'
 print(f"[BEST SOLUTION] {final_best_summary} multiplications")
 print(f"[TIP] To view TensorBoard: tensorboard --logdir {FINAL_TENSORBOARD_PATH}")
-print(f"[STANDARD] Training completed with standard PyTorch/transformers using 8-bit quantization") 
+print(f"[STANDARD] Training completed with standard PyTorch/transformers using 4-bit quantization") 

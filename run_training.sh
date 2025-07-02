@@ -45,7 +45,7 @@ try:
     import peft
     print('✅ Transformers and PEFT successfully installed!')
     print(f'   - Transformers version: {transformers.__version__}')
-    print(f'   - Using 8-bit quantization with 4k context length')
+    print(f'   - Using 4-bit quantization with 512 token context length')
 except ImportError as e:
     print(f'⚠️  Import error: {e}')
     print('   - Please check your installations')
@@ -95,9 +95,9 @@ if [ "$GPU_COUNT" -eq 4 ]; then
     echo "🚀 **4 GPU DISTRIBUTED TRAINING MODE**"
     echo "   - GPUs: 4x Tesla T4 (15GB each)"
     echo "   - Total VRAM: 60GB"
-    echo "   - Mode: Multi-GPU GRPO training with 8-bit quantization"
-    echo "   - Expected batch size: 8 per GPU (total effective: 64)"
-    echo "   - Configuration: 8-bit quantization with 4k context length"
+    echo "   - Mode: Multi-GPU GRPO training with 4-bit quantization"
+    echo "   - Expected batch size: 4 per GPU (total effective: 64)"
+    echo "   - Configuration: 4-bit quantization with 512 token context length"
     
     # Set optimal environment for 4 GPU training
     export NCCL_DEBUG=INFO
@@ -164,7 +164,7 @@ fi
 
 echo ""
 echo "🎯 **Training completed!**"
-echo "   - Training using 8-bit quantization with 4k context length"
+echo "   - Training using 4-bit quantization with 512 token context length"
 echo "   - Check tensorboard logs for training progress"
 echo "   - Model saved to: /home/ec2-user/matmul_outputs/models/"
 echo "   - Discovery logs saved in outputs directory" 
