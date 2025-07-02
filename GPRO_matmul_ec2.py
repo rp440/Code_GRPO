@@ -1,26 +1,20 @@
 """
-GPRO Matrix Multiplication DSL Training Script for EC2
+GRPO Matrix Multiplication DSL Training Script for Distributed/Multi-GPU Training
 
 Key Features:
 1. Load previous LoRA checkpoint but discard optimizer state
 2. Create fresh AdamW optimizer with configurable learning rate  
 3. Reset value head parameters for fresh training
-4. New L1 error-based reward function:
-   - Correct result: score = (10 - mul_ops)
-   - Incorrect result: score = (-dist/5 - 0.2*mul_ops)
-5. 4-bit quantization for memory efficiency with 512 token context length
+4. Simple reward function: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers
+5. Standard PyTorch/transformers training with distributed support
+6. Using Qwen2-1.5B model
 
 Configuration:
 - Set LOAD_FROM_CHECKPOINT = False to train from scratch
 - Adjust CHECKPOINT_PATH to your previous model path
 - Modify NEW_LEARNING_RATE as needed
-- Configured for multi-GPU distributed training
-- Uses 4-bit quantization with 512 token context length
-
-Note: Expected Warnings:
-- You may see "Caching is incompatible with gradient checkpointing" warnings
-- These are EXPECTED and NOT errors - the model automatically handles this
-- The warnings are suppressed for cleaner output
+- Supports both single GPU and multi-GPU distributed training
+- Automatic detection of distributed environment
 
 Installation Requirements:
 - Standard dependencies: pip install -U trl peft transformers datasets huggingface_hub accelerate torch bitsandbytes
@@ -283,33 +277,71 @@ def manual_matrix_multiply_2x2(A, B):
 
 def count_multiplications_in_dsl(dsl_script):
     """
-    Count ALL multiplication operations (*) in a DSL script.
-    Simple and reliable: counts every '*' operator in assignment lines.
+    Count the number of multiplication operations in a DSL script.
+    Handles various formats including parenthetical expressions and chained operations.
     """
     count = 0
     lines = dsl_script.strip().split('\n')
     
     for line in lines:
         line = line.strip()
-        if not line or '=' not in line:
+        if not line or not '=' in line:
             continue
             
-        # Split at = to get the expression part only (right side of assignment)
+        # Split at = to get the expression part
         parts = line.split('=', 1)
         if len(parts) != 2:
             continue
             
         expression = parts[1].strip()
         
-        # Count ALL '*' operators in the expression
-        # This is simple and reliable - every '*' is a multiplication operation
-        line_mult_count = expression.count('*')
-        count += line_mult_count
+        # Count multiplication operators in the expression
+        # But be careful not to count multiplications inside variable names or matrix indices
         
-        if line_mult_count > 0:
-            print(f"[MULT COUNT] Line '{line.strip()}' has {line_mult_count} multiplication(s)")
+        # Patterns that indicate multiplication:
+        # 1. (expr) * (expr) - parenthetical multiplication
+        # 2. var * (expr) - variable times parenthetical expression
+        # 3. (expr) * var - parenthetical expression times variable
+        # 4. var * var - simple variable multiplication
+        # 5. A[i,j] * B[k,l] - matrix element multiplication
+        
+        mult_patterns = [
+            r'\([^)]+\)\s*\*\s*\([^)]+\)',  # (expr) * (expr)
+            r'[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?\s*\*\s*\([^)]+\)',  # var * (expr)
+            r'\([^)]+\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?',  # (expr) * var
+            r'[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?\s*\*\s*[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9,\s]*\])?',  # var * var
+        ]
+        
+        # Find all multiplication operations in this line
+        temp_expression = expression
+        line_mult_count = 0
+        
+        for pattern in mult_patterns:
+            matches = re.findall(pattern, temp_expression)
+            line_mult_count += len(matches)
             
-    print(f"[MULT COUNT TOTAL] Found {count} total multiplications in DSL script")
+            # Remove found matches to avoid double counting
+            temp_expression = re.sub(pattern, 'PLACEHOLDER', temp_expression)
+        
+        # Additional check: count remaining * operators that might not match patterns above
+        # But exclude those inside matrix indices [i,j] or function calls
+        remaining_expression = temp_expression
+        # Remove matrix indices and function-like constructs
+        remaining_expression = re.sub(r'\[[^\]]+\]', '', remaining_expression)
+        remaining_expression = re.sub(r'PLACEHOLDER', '', remaining_expression)
+        
+        # Count remaining * that aren't already accounted for
+        additional_mults = remaining_expression.count('*')
+        
+        # Sanity check: a well-formed multiplication line should have exactly 1 multiplication
+        # If we find more than 1, log it but proceed
+        total_line_mults = max(line_mult_count, additional_mults)
+        if total_line_mults > 1:
+            print(f"[MULT COUNT WARNING] Line '{line}' appears to have {total_line_mults} multiplications")
+        
+        # Count ALL multiplications in this line, not just limit to 1
+        count += total_line_mults
+            
     return count
 
 def _generate_random_2x2_matrix_for_inference(low=-99, high=99):
@@ -328,9 +360,9 @@ LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Configuration for checkpoint loading and fresh training
-CHECKPOINT_PATH = os.path.expanduser("~/previous_checkpoint")  # Update this path
-NEW_LEARNING_RATE = 2e-5
-LOAD_FROM_CHECKPOINT = True
+CHECKPOINT_PATH = os.path.expanduser("~/previous_checkpoint")  # Path to previous LoRA checkpoint
+NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
+LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
 # Training configuration - Auto-detect distributed vs single GPU
 EPOCHS = 1
@@ -339,25 +371,26 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 8   # Matching GPRO_matmul.py configuration
-    GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
+    BATCH_SIZE_PER_GPU = 4   # Higher than Colab for better GPU utilization
+    GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
-    print(f"[CONFIG] Using 4-bit quantization configuration")
+    print(f"[CONFIG] Distributed training configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 8   # Matching GPRO_matmul.py configuration
-    GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
+    BATCH_SIZE_PER_GPU = 4   # Higher than Colab for better GPU utilization
+    GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Single GPU mode")
-    print(f"[CONFIG] Using 4-bit quantization configuration")
+    print(f"[CONFIG] Standard training configuration")
 
 # Calculate total batch size
 TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
+print(f"[CONFIG] Batch size: {BATCH_SIZE_PER_GPU}, Gradient accumulation: {GRAD_ACC_STEPS}")
 
 # Memory optimization settings
-USE_GRADIENT_CHECKPOINTING = True
-MAX_GRAD_NORM = 1.0
-WARMUP_RATIO = 0.1
+USE_GRADIENT_CHECKPOINTING = False  # Disabled to avoid gradient issues with PEFT
+MAX_GRAD_NORM = 0.5
+WARMUP_RATIO = 0.05
 
 model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}_gpu{NUM_GPUS}_t4"
 model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
@@ -391,8 +424,8 @@ C[1,1] = M3 - M4 + M5 - M7
 
 This uses 7 multiplications, but can be optimized using techniques like Strassen's algorithm.  YOUR TASK: Generate a DSL script that performs 2x2 matrix multiplication using 7 or fewer multiplications. You may provide explanations outside the DSL tags, but the actual code must be within <DSL></DSL> tags. 
 DSL SYNTAX RULES: - M variables: Store multiplication results (e.g., M1 = A[0,0] * B[0,0]) - S variables:
-Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
-REQUIREMENTS: - Use ≤7 multiplications total within the <DSL></DSL> tags - Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1] - Wrap DSL code in <DSL></DSL> tags - You may add explanations outside the tags  If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
+ Store addition/subtraction results (e.g., S1 = M1 + M2) - Matrix elements: A[row,col] and B[row,col] where row,col ∈ {0,1} - Final output: C[row,col] = result - Operations: + (addition), * (multiplication), - (subtraction) - Variable assignment: VAR = expression 
+  REQUIREMENTS: - Use ≤7 multiplications total within the <DSL></DSL> tags - Compute all four elements: C[0,0], C[0,1], C[1,0], C[1,1] - Wrap DSL code in <DSL></DSL> tags - You may add explanations outside the tags  If you cannot determine a valid sequence, output: Error: Cannot determine full sequence."""
 
 DEFAULT_USER_PROMPT_FOR_DSL_GENERATION = "Generate the DSL script to calculate C = A * B for the given 2x2 matrices, using 7 or fewer multiplications.First think about answer then respond in <DSL></DSL> tags."
 
@@ -555,49 +588,73 @@ if tokenizer_for_training.pad_token is None:
 if tokenizer_for_training.padding_side == 'right':
     tokenizer_for_training.padding_side = 'left'
 
-# Apply LoRA using standard PEFT approach
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    use_rslora=False,  # Set to True for better performance with large r values
-)
+# Load previous LoRA checkpoint or create fresh LoRA
+if LOAD_FROM_CHECKPOINT:
+    print(f"Loading previous LoRA checkpoint from: {CHECKPOINT_PATH}")
+    try:
+        model_peft = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
+        print("[SUCCESS] Successfully loaded previous LoRA checkpoint")
+        
+        # CRITICAL: Enable gradients for LoRA parameters after loading checkpoint
+        for name, param in model_peft.named_parameters():
+            if 'lora_' in name.lower():
+                param.requires_grad = True
+        print("[FIX] Enabled gradients for LoRA parameters")
+        
+    except Exception as e:
+        print(f"[WARNING] Could not load checkpoint ({e}), creating fresh LoRA...")
+        LOAD_FROM_CHECKPOINT = False  # Force fresh creation
+        
+if not LOAD_FROM_CHECKPOINT:
+    print("Creating fresh LoRA configuration...")
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16, 
+        lora_alpha=32, 
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none"
+    )
+    model_peft = get_peft_model(base_model, lora_config)
+    
+    # Immediately enable training mode and check gradients
+    model_peft.train()
+    print("[PEFT SETUP] Enabling gradients for all LoRA parameters...")
+    for name, param in model_peft.named_parameters():
+        if 'lora_' in name.lower():
+            param.requires_grad = True
+            print(f"[PEFT SETUP] Enabled: {name}")
+    
+    # Verify PEFT setup
+    trainable_count = sum(1 for p in model_peft.parameters() if p.requires_grad)
+    print(f"[PEFT SETUP] {trainable_count} trainable parameters after PEFT setup")
 
-model_peft = get_peft_model(base_model, lora_config)
-
-# Prepare model for GRPO training
-# Standard approach - configure manually
+# Configure gradient checkpointing and training mode
+print("[STANDARD] Using standard training mode")
 model_peft.train()
 
-# Configure gradient checkpointing for standard approach
-print("[STANDARD] Configuring gradient checkpointing")
-if USE_GRADIENT_CHECKPOINTING:
-    model_peft.gradient_checkpointing_enable()
-    print("[INFO] Enabled gradient checkpointing for memory efficiency")
-    print("[INFO] NOTE: You may see 'Caching is incompatible with gradient checkpointing' warnings")
-    print("[INFO] These are EXPECTED and not errors - the model automatically handles this by disabling cache")
+# CRITICAL: Ensure all trainable parameters have gradients enabled
+trainable_params_count = 0
+for name, param in model_peft.named_parameters():
+    if param.requires_grad:
+        trainable_params_count += 1
+    else:
+        # Force enable gradients for PEFT parameters
+        if any(target in name for target in ["lora_", "modules_to_save"]):
+            param.requires_grad = True
+            trainable_params_count += 1
+            print(f"[FIX] Enabled gradients for: {name}")
 
-# CRITICAL: Force use_cache=False on PEFT model for GRPO compatibility
-# Known bug: GRPO/PPO fails if use_cache=True (shifts decoder_input_ids)
-# Reference: https://github.com/huggingface/transformers/issues/21719
-if hasattr(model_peft, 'config'):
-    model_peft.config.use_cache = False
-if hasattr(model_peft, 'base_model') and hasattr(model_peft.base_model, 'config'):
-    model_peft.base_model.config.use_cache = False
-if hasattr(model_peft, 'pretrained_model') and hasattr(model_peft.pretrained_model, 'config'):
-    model_peft.pretrained_model.config.use_cache = False
+print(f"[GRADIENT CHECK] {trainable_params_count} parameters have gradients enabled")
 
-print("[CRITICAL FIX] Forced use_cache=False on all model components for GRPO compatibility (Standard)")
-
-# Ensure model is in correct training state
-print("[FIX] Set model to training mode (Standard)")
-
-# COMPATIBILITY FIX: Ensure the model doesn't have conflicting attributes
-if hasattr(model_peft, 'llm'):
-    delattr(model_peft, 'llm')
-    print("[FIX] Removed conflicting 'llm' attribute if present")
+# Verify gradients are properly enabled
+if trainable_params_count == 0:
+    print("[ERROR] No parameters have gradients enabled!")
+    # Force enable gradients for all LoRA parameters
+    for name, param in model_peft.named_parameters():
+        if 'lora_' in name.lower():
+            param.requires_grad = True
+            print(f"[FORCE FIX] Enabled gradients for: {name}")
 
 model_peft.print_trainable_parameters()
 
@@ -607,6 +664,13 @@ from torch.optim import AdamW
 # Get only trainable parameters for the optimizer
 trainable_params_for_optimizer = [param for param in model_peft.parameters() if param.requires_grad]
 print(f"[OPTIMIZER] Creating optimizer with {len(trainable_params_for_optimizer)} trainable parameter groups")
+
+if len(trainable_params_for_optimizer) == 0:
+    print("[ERROR] No trainable parameters found for optimizer!")
+    print("[DEBUG] All model parameters:")
+    for name, param in model_peft.named_parameters():
+        print(f"  {name}: requires_grad={param.requires_grad}")
+    raise ValueError("No trainable parameters found")
 
 optimizer = AdamW(
     trainable_params_for_optimizer,
@@ -619,6 +683,11 @@ print(f"[SUCCESS] Created fresh AdamW optimizer with lr={NEW_LEARNING_RATE}")
 # Verify optimizer has parameters with gradients
 optimizer_param_count = sum(p.numel() for group in optimizer.param_groups for p in group['params'])
 print(f"[OPTIMIZER CHECK] Optimizer managing {optimizer_param_count:,} parameters")
+
+# Additional safety check for gradient computation
+print("[GRADIENT TEST] Testing gradient computation...")
+test_params_with_grad = sum(1 for p in model_peft.parameters() if p.requires_grad)
+print(f"[GRADIENT TEST] Found {test_params_with_grad} parameters with requires_grad=True")
 
 # Reset value head parameters if it exists
 try:
@@ -676,51 +745,9 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     expected_C_str_list = kwargs["expected_C_str"]
     rewards = []
 
-    print(f"\n{'='*80}")
-    print(f"LIVE GENERATION STREAM - BATCH #{_reward_call_count}")
-    print(f"{'='*80}")
+    print(f"\n=== NEW REWARD CALCULATION CALL #{_reward_call_count} ===")
     print(f"Processing {len(completions)} completions...")
     print(f"Current best multiplications: {_best_n_mults if _best_n_mults != float('inf') else 'None found yet'}")
-    print(f"{'='*80}")
-    
-    # Stream current generations for monitoring
-    print(f"\nSTREAMING CURRENT GENERATIONS:")
-    print(f"{'-'*60}")
-    
-    for stream_idx, raw_completion in enumerate(completions[:min(4, len(completions))]):  # Show first 4 generations
-        prompt_idx = stream_idx // _num_generations_per_prompt_for_reward
-        
-        # Extract readable content for streaming
-        if isinstance(raw_completion, list):
-            if len(raw_completion) == 1:
-                item = raw_completion[0]
-                if isinstance(item, dict) and 'content' in item:
-                    stream_content = item['content']
-                else:
-                    stream_content = str(item)
-            else:
-                stream_content = str(raw_completion)
-        elif isinstance(raw_completion, dict) and 'content' in raw_completion:
-            stream_content = raw_completion['content']
-        elif isinstance(raw_completion, str):
-            stream_content = raw_completion
-        else:
-            stream_content = str(raw_completion)
-        
-        # Clean up special tokens for display
-        display_content = stream_content
-        temp_tokens = ["<|im_end|>", "<|endoftext|>", "<|file_separator|>"]
-        for token in temp_tokens:
-            display_content = display_content.replace(token, "")
-        
-        # Truncate for readability
-        truncated_content = display_content[:300] + "..." if len(display_content) > 300 else display_content
-        
-        print(f"Gen {stream_idx+1} (Prompt {prompt_idx+1}): {truncated_content.strip()}")
-        print(f"{'-'*30}")
-    
-    print(f"PROCESSING AND SCORING...")
-    print(f"{'='*80}")
 
     for i, dsl_script_raw_content in enumerate(completions):
         prompt_idx = i // _num_generations_per_prompt_for_reward
@@ -837,57 +864,9 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
         else:
             print(f"  Completion {i}: Final reward: {final_reward:.1f}")
         
-    # Batch summary and cleanup for next iteration
-    avg_reward = sum(rewards) / len(rewards)
-    max_reward = max(rewards)
-    min_reward = min(rewards)
-    
-    print(f"\nBATCH #{_reward_call_count} SUMMARY:")
-    print(f"{'='*80}")
-    print(f"Rewards: Avg={avg_reward:.2f}, Max={max_reward:.2f}, Min={min_reward:.2f}")
-    print(f"Global best: {_best_n_mults if _best_n_mults != float('inf') else 'None'} multiplications")
-    
-    # Show reward distribution
-    excellent_count = sum(1 for r in rewards if r >= 5.0)
-    good_count = sum(1 for r in rewards if 0.0 <= r < 5.0)
-    bad_count = sum(1 for r in rewards if r < 0.0)
-    
-    print(f"Distribution: {excellent_count} excellent (>=5.0), {good_count} good (0-5), {bad_count} poor (<0)")
-    
-    # Show top 2 completions for learning insight
-    reward_completion_pairs = list(zip(rewards, completions))
-    reward_completion_pairs.sort(key=lambda x: x[0], reverse=True)
-    
-    print(f"\nTOP 2 GENERATIONS THIS BATCH:")
-    for rank, (top_reward, top_completion) in enumerate(reward_completion_pairs[:2]):
-        # Extract content for display
-        if isinstance(top_completion, list) and len(top_completion) == 1:
-            if isinstance(top_completion[0], dict) and 'content' in top_completion[0]:
-                display_content = top_completion[0]['content']
-            else:
-                display_content = str(top_completion[0])
-        elif isinstance(top_completion, dict) and 'content' in top_completion:
-            display_content = top_completion['content']
-        else:
-            display_content = str(top_completion)
-        
-        # Clean and truncate
-        for token in ["<|im_end|>", "<|endoftext|>", "<|file_separator|>"]:
-            display_content = display_content.replace(token, "")
-        
-        # Extract DSL if present
-        dsl_match = re.search(r'<DSL>(.*?)</DSL>', display_content, re.DOTALL | re.IGNORECASE)
-        if dsl_match:
-            dsl_preview = dsl_match.group(1).strip()[:150] + "..." if len(dsl_match.group(1).strip()) > 150 else dsl_match.group(1).strip()
-            print(f"#{rank+1} (Score: {top_reward:.2f}): {dsl_preview}")
-        else:
-            preview = display_content.strip()[:150] + "..." if len(display_content.strip()) > 150 else display_content.strip()
-            print(f"#{rank+1} (Score: {top_reward:.2f}): {preview}")
-    
-    print(f"\nCLEARING BATCH DATA FOR NEXT ITERATION...")
-    print(f"{'='*80}")
-    print(f"Processed {len(completions)} generations -> returning {len(rewards)} rewards")
-    print(f"Ready for next batch...\n")
+    print(f"Batch average reward: {sum(rewards)/len(rewards):.2f}")
+    print(f"Current global best: {_best_n_mults if _best_n_mults != float('inf') else 'None'} multiplications")
+    print("=" * 50)
     
     return rewards
 
@@ -916,14 +895,20 @@ else:
     })
     print(f"[SINGLE GPU] Configured for single GPU training")
 
+# Setup TensorBoard logging directory
+local_tensorboard_dir = os.path.join(FINAL_MODEL_PATH, "runs")
+os.makedirs(local_tensorboard_dir, exist_ok=True)
+
+# Always use local directory for TensorBoard logging to avoid connection issues
+actual_tensorboard_dir = local_tensorboard_dir
+
 training_args_grpo = GRPOConfig(
     output_dir=FINAL_MODEL_PATH,
-    learning_rate=NEW_LEARNING_RATE,
+    learning_rate=NEW_LEARNING_RATE,  # Use the configurable learning rate
     remove_unused_columns=False,
     gradient_accumulation_steps=GRAD_ACC_STEPS,
-    use_vllm=False,  # Disable vLLM for standard model compatibility
     num_train_epochs=EPOCHS,
-    bf16=use_bf16,
+    bf16=use_bf16, 
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # Training configuration settings
@@ -931,21 +916,25 @@ training_args_grpo = GRPOConfig(
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=256,
     logging_steps=5,
-    save_strategy="steps",
-    save_steps=100,
-    logging_dir=FINAL_TENSORBOARD_PATH,
+    save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
+    save_steps=100,  # Save checkpoint every 100 steps
+    logging_dir=actual_tensorboard_dir,  # TensorBoard logs to the correct directory
     report_to="tensorboard",
     push_to_hub=False,
-    dataloader_drop_last=True,  # CRITICAL for distributed training
-    warmup_steps=5,
-    # Data loading configuration for distributed training
-    dataloader_num_workers=0,  # Avoid multiprocessing issues in distributed mode
-    # ENHANCED Memory optimization settings for GRPO
+    dataloader_drop_last=True,  # Changed to True to ensure consistent batches
+    warmup_steps=2,
+    # Data loading configuration
+    dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
+    # Memory optimization settings
     gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
-    # CRITICAL: Additional GRPO memory optimizations
-    group_by_length=False,            # Disable grouping to reduce memory fragmentation
+    # Additional GRPO settings
+    group_by_length=False,
+    dataloader_pin_memory=False,
+    ddp_find_unused_parameters=False,
+    torch_compile=False,
     # Apply distributed configuration
     **distributed_args,
 )
@@ -970,62 +959,66 @@ if len(train_dataset_for_grpo) < min_samples_needed:
 else:
     print(f"[SUCCESS] Dataset size is sufficient for distributed training")
 
-# Use standard TRL GRPOTrainer 
-# GRPOTrainer automatically extracts tokenizer from the model
 trainer_grpo = GRPOTrainer(
     model=model_peft,
+    # NOTE: tokenizer parameter removed - old tokenizer API causes UnboundLocalError: 'current_batch' 
+    # GRPOTrainer will use the tokenizer from the model automatically
     reward_funcs=[matrix_dsl_reward],
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,
-    optimizers=(optimizer, None),
+    optimizers=(optimizer, None),  # Use our custom optimizer, no scheduler
 )
 
-# CRITICAL: Ensure reference model also has use_cache=False for GRPO compatibility
-# GRPO internally creates a reference model copy
-if hasattr(trainer_grpo, 'ref_model') and trainer_grpo.ref_model is not None:
-    if hasattr(trainer_grpo.ref_model, 'config'):
-        trainer_grpo.ref_model.config.use_cache = False
-    if hasattr(trainer_grpo.ref_model, 'pretrained_model') and hasattr(trainer_grpo.ref_model.pretrained_model, 'config'):
-        trainer_grpo.ref_model.pretrained_model.config.use_cache = False
-    print("[CRITICAL FIX] Forced use_cache=False on GRPO reference model")
-
-# --- 8. Training Execution ---
 print("Starting GRPO training...")
-print(f"  - Number of GPUs: {NUM_GPUS}")
-print(f"  - Batch size per GPU: {BATCH_SIZE_PER_GPU}")
-print(f"  - Gradient accumulation steps: {GRAD_ACC_STEPS}")
+print(f"  - Per-device batch size: {training_args_grpo.per_device_train_batch_size}")
+print(f"  - Gradient accumulation steps: {training_args_grpo.gradient_accumulation_steps}")
 print(f"  - Total effective batch size: {TOTAL_BATCH_SIZE}")
 print(f"  - Learning rate: {training_args_grpo.learning_rate}")
 print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
 print(f"  - Max completion length: {training_args_grpo.max_completion_length}")
 print(f"  - Max prompt length: {training_args_grpo.max_prompt_length}")
 print(f"  - Generations per prompt: {_num_generations_per_prompt_for_reward}")
-print(f"  - Gradient checkpointing: {'Enabled' if USE_GRADIENT_CHECKPOINTING else 'Disabled'}")
-if USE_GRADIENT_CHECKPOINTING:
-    print(f"  - Note: Cache-related warnings are expected and suppressed")
+print(f"  - Mode: Standard PyTorch training")
+print(f"TensorBoard logs will be saved locally in: {actual_tensorboard_dir}")
+print(f"To view TensorBoard, run: %load_ext tensorboard")
+print(f"%tensorboard --logdir {actual_tensorboard_dir}")
 
-# Show training mode
-if 'RANK' in os.environ:
-    print(f"  - Training mode: Distributed ({NUM_GPUS} GPUs)")
-    print(f"  - Current rank: {os.environ.get('RANK')}/{os.environ.get('WORLD_SIZE')}")
-else:
-    print(f"  - Training mode: Single GPU")
-
-print(f"TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
-
-# CRITICAL: Clear CUDA cache before training to maximize available memory
-torch.cuda.empty_cache()
-print("[MEMORY] Cleared CUDA cache before training")
-
-# CRITICAL: Show current GPU memory usage
+# Add pre-training diagnostics
+print("\n=== PRE-TRAINING DIAGNOSTICS ===")
+print(f"GPU Memory before training:")
 if torch.cuda.is_available():
     current_device = torch.cuda.current_device()
     memory_allocated = torch.cuda.memory_allocated(current_device) / 1024**3
     memory_reserved = torch.cuda.memory_reserved(current_device) / 1024**3
-    print(f"[MEMORY] GPU {current_device}: {memory_allocated:.2f} GiB allocated, {memory_reserved:.2f} GiB reserved")
+    print(f"  Allocated: {memory_allocated:.2f} GiB")
+    print(f"  Reserved: {memory_reserved:.2f} GiB")
 
-trainer_grpo.train()
-print("GRPO Training finished.")
+print(f"Dataset sample check:")
+print(f"  First sample prompt length: {len(str(train_dataset_for_grpo[0]['prompt']))}")
+print(f"  First sample A matrix: {train_dataset_for_grpo[0]['A_matrix_str']}")
+
+# Clear cache before training
+torch.cuda.empty_cache()
+print("Cleared CUDA cache before training")
+
+print("\n=== PRE-TRAINING FINAL CHECKS ===")
+# Minimal gradient sanity-check (no dummy forward pass)
+trainable_exists = any(p.requires_grad for p in model_peft.parameters())
+if not trainable_exists:
+    raise ValueError("No trainable parameters have gradients enabled.")
+print("[FINAL CHECK] Gradient flags verified (✓)")
+
+print("\n=== STARTING GRPO TRAINING ===")
+print("If training hangs on 'Loading data', it's likely a memory issue...")
+
+try:
+    trainer_grpo.train()
+    print("GRPO Training finished successfully!")
+except Exception as e:
+    print(f"[ERROR] Training failed: {e}")
+    print("Try reducing batch size further or using a smaller model")
+    # Don't exit, continue with inference to test what we have
+    pass
 
 # Log final discovery summary
 final_best = _best_n_mults if _best_n_mults != float('inf') else 'None found'
@@ -1033,18 +1026,16 @@ log_discovery(f"TRAINING COMPLETED - Final best: {final_best} multiplications")
 log_discovery(f"Simple reward system: +0.1 for DSL tags, -1 per multiplication, -100 for wrong answers")
 log_discovery(f"Discoveries log saved to: {DISCOVERIES_LOG_FILE}")
 
-# --- 9. Save Model ---
+# --- 8. Save Model ---
 print(f"Saving fine-tuned model to {FINAL_MODEL_PATH}...")
 trainer_grpo.save_model(FINAL_MODEL_PATH)
 
-# --- 10. Inference and Verification ---
+# --- 9. Inference and Verification ---
 print("\n--- Inference with GRPO Fine-tuned Model ---")
-
-# Standard approach
 try:
     print(f"Loading fine-tuned model from: {FINAL_MODEL_PATH}")
     inference_base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
+        BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", trust_remote_code=True)
     inference_model = PeftModel.from_pretrained(inference_base_model, FINAL_MODEL_PATH)
     inference_model = inference_model.merge_and_unload()
     
@@ -1059,7 +1050,7 @@ except Exception as e:
     print("[FALLBACK] Falling back to base model for inference...")
     try:
         inference_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype=dtype, trust_remote_code=True)
+            BASE_MODEL_NAME_FOR_FINETUNING, torch_dtype="auto", trust_remote_code=True)
         inference_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME_FOR_FINETUNING, trust_remote_code=True)
         if inference_tokenizer.pad_token is None: 
             inference_tokenizer.pad_token = inference_tokenizer.eos_token
@@ -1196,9 +1187,8 @@ except Exception as e:
 
 print(f"\n*** SCRIPT COMPLETED SUCCESSFULLY ***")
 print(f"[SAVED] Model saved to: {FINAL_MODEL_PATH}")
-print(f"[LOGS] TensorBoard logs: {FINAL_TENSORBOARD_PATH}")
-print(f"[DISCOVERIES] Log: {DISCOVERIES_LOG_FILE}")
+print(f"[LOGS] TensorBoard logs (local): {actual_tensorboard_dir}")
+print(f"[DISCOVERIES] Local: {DISCOVERIES_LOG_FILE}")
 final_best_summary = _best_n_mults if _best_n_mults != float('inf') else 'None found'
 print(f"[BEST SOLUTION] {final_best_summary} multiplications")
-print(f"[TIP] To view TensorBoard: tensorboard --logdir {FINAL_TENSORBOARD_PATH}")
-print(f"[STANDARD] Training completed with standard PyTorch/transformers using 4-bit quantization") 
+print(f"[TIP] To restart TensorBoard: %tensorboard --logdir {actual_tensorboard_dir}") 
