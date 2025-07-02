@@ -54,8 +54,8 @@ except Exception as e:
 "
 
 # Create necessary directories
-mkdir -p /home/ec2-user/matmul_outputs/models
-mkdir -p /home/ec2-user/matmul_outputs/tensorboard_logs
+mkdir -p ~/matmul_outputs/models
+mkdir -p ~/matmul_outputs/tensorboard_logs
 
 # Generate dataset first
 echo "Generating training dataset..."
@@ -177,5 +177,5 @@ echo ""
 echo "🎯 **Training completed!**"
 echo "   - Training using 4-bit quantization with 512 token context length"
 echo "   - Check tensorboard logs for training progress"
-echo "   - Model saved to: /home/ec2-user/matmul_outputs/models/"
+echo "   - Model saved to: ~/matmul_outputs/models/"
 echo "   - Discovery logs saved in outputs directory" 

@@ -68,8 +68,8 @@ else:
     print("[MEMORY] Cleared CUDA cache")
 
 # --- 1. Paths Configuration ---
-# Base directory for all outputs
-BASE_OUTPUT_DIR = "/home/ec2-user/matmul_outputs"
+# Base directory for all outputs - use current user's home directory
+BASE_OUTPUT_DIR = os.path.expanduser("~/matmul_outputs")
 MODEL_SAVE_DIR = os.path.join(BASE_OUTPUT_DIR, "models")
 TENSORBOARD_LOGS_DIR = os.path.join(BASE_OUTPUT_DIR, "tensorboard_logs")
 DATASET_PATH = "./matrix_io_data_for_grpo.jsonl"
@@ -316,7 +316,7 @@ LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Configuration for checkpoint loading and fresh training
-CHECKPOINT_PATH = "/home/ec2-user/previous_checkpoint"  # Update this path
+CHECKPOINT_PATH = os.path.expanduser("~/previous_checkpoint")  # Update this path
 NEW_LEARNING_RATE = 2e-5
 LOAD_FROM_CHECKPOINT = True
 
