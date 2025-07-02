@@ -6,7 +6,7 @@
 #  apt install python3.11 python3.11-venv python3.11-dev python3.11-distutils -y
 
 # python3.11 -m venv myproject311
- python -m venv myproject311
+ python3 -m venv myproject311
 
 
 # Activate virtual environment
@@ -33,13 +33,13 @@ pip install --upgrade pip wheel
 
 
 # Verify installations
-python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
-python -c "import torch; print(f'NCCL version: {torch.cuda.nccl.version()}')" || echo "NCCL not available"
+python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python3 -c "import torch; print(f'NCCL version: {torch.cuda.nccl.version()}')" || echo "NCCL not available"
 
 # Verify transformers installation
 echo "Verifying transformers installation..."
-python -c "
+python3 -c "
 try:
     import transformers
     import peft
@@ -59,14 +59,14 @@ mkdir -p /home/ec2-user/matmul_outputs/tensorboard_logs
 
 # Generate dataset first
 echo "Generating training dataset..."
-python dataset.py
+python3 dataset.py
 
 # Set Hugging Face token (replace with your token)
 # export HUGGING_FACE_HUB_TOKEN="your_token_here"
 
 # Check if NCCL is working properly
 echo "Testing NCCL compatibility..."
-python -c "
+python3 -c "
 import torch
 import torch.distributed as dist
 try:
@@ -87,24 +87,35 @@ except Exception as e:
 "
 
 # Check number of available GPUs
-GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())")
-echo "Detected $GPU_COUNT GPUs"
+echo "Detecting GPUs..."
+GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>&1)
 
-# **4 GPU DISTRIBUTED TRAINING SETUP**
+# Debug: Show raw output
+echo "Raw GPU detection output: '$GPU_COUNT'"
+
+# Handle case where GPU detection fails or returns non-numeric
+if [ -z "$GPU_COUNT" ] || ! [[ "$GPU_COUNT" =~ ^[0-9]+$ ]]; then
+    echo "⚠️  GPU detection failed or returned non-numeric value, defaulting to 0 GPUs (CPU only)"
+    echo "   Raw output was: '$GPU_COUNT'"
+    GPU_COUNT=0
+fi
+
+echo "✅ Detected $GPU_COUNT GPUs"
+
+# **2 GPU DISTRIBUTED TRAINING SETUP**
 if [ "$GPU_COUNT" -eq 2 ]; then
-    echo "🚀 **4 GPU DISTRIBUTED TRAINING MODE**"
-    echo "   - GPUs: 4x Tesla T4 (15GB each)"
-    echo "   - Total VRAM: 60GB"
+    echo "🚀 **2 GPU DISTRIBUTED TRAINING MODE**"
+    echo "   - GPUs: 2x GPU (detected)"
     echo "   - Mode: Multi-GPU GRPO training with 4-bit quantization"
-    echo "   - Expected batch size: 4 per GPU (total effective: 64)"
+    echo "   - Expected batch size: 8 per GPU × 16 grad_acc = 256 total effective"
     echo "   - Configuration: 4-bit quantization with 512 token context length"
     
-    # Set optimal environment for 4 GPU training
+    # Set optimal environment for 2 GPU training
     export NCCL_DEBUG=INFO
     export CUDA_LAUNCH_BLOCKING=0
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
     
-    # Try torchrun first (recommended for 4 GPUs)
+    # Try torchrun first (recommended for 2 GPUs)
     echo "Launching with torchrun (recommended)..."
     torchrun \
         --nproc_per_node=2 \
@@ -116,8 +127,8 @@ if [ "$GPU_COUNT" -eq 2 ]; then
     # If torchrun fails, try torch.distributed.launch
     if [ $? -ne 0 ]; then
         echo "torchrun failed, trying torch.distributed.launch..."
-        python -m torch.distributed.launch \
-            --nproc_per_node=4 \
+        python3 -m torch.distributed.launch \
+            --nproc_per_node=2 \
             --master_port=29500 \
             --use_env \
             GPRO_matmul_ec2.py
@@ -126,8 +137,8 @@ if [ "$GPU_COUNT" -eq 2 ]; then
     # Final fallback to single GPU
     if [ $? -ne 0 ]; then
         echo "❌ Distributed training failed, falling back to single GPU..."
-        echo "   - This will be ~4x slower but will work"
-        CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
+        echo "   - This will be ~2x slower but will work"
+        CUDA_VISIBLE_DEVICES=0 python3 GPRO_matmul_ec2.py
     fi
 
 elif [ "$GPU_COUNT" -gt 1 ]; then
@@ -143,7 +154,7 @@ elif [ "$GPU_COUNT" -gt 1 ]; then
     # If torchrun fails, try the older method
     if [ $? -ne 0 ]; then
         echo "torchrun failed, trying torch.distributed.launch..."
-        python -m torch.distributed.launch \
+        python3 -m torch.distributed.launch \
             --nproc_per_node=$GPU_COUNT \
             --master_port=29500 \
             --use_env \
@@ -153,13 +164,13 @@ elif [ "$GPU_COUNT" -gt 1 ]; then
     # If both fail, fall back to single GPU
     if [ $? -ne 0 ]; then
         echo "Distributed training failed, falling back to single GPU..."
-        CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
+        CUDA_VISIBLE_DEVICES=0 python3 GPRO_matmul_ec2.py
     fi
 else
     echo "💻 **SINGLE GPU TRAINING MODE**"
     echo "   - Using GPU 0 only"
     echo "   - Will be slower but more stable"
-    CUDA_VISIBLE_DEVICES=0 python GPRO_matmul_ec2.py
+    CUDA_VISIBLE_DEVICES=0 python3 GPRO_matmul_ec2.py
 fi
 
 echo ""

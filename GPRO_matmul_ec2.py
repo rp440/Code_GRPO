@@ -327,14 +327,14 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 4   # Matching GPRO_matmul.py configuration
+    BATCH_SIZE_PER_GPU = 8   # Matching GPRO_matmul.py configuration
     GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Using 4-bit quantization configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4   # Matching GPRO_matmul.py configuration
+    BATCH_SIZE_PER_GPU = 8   # Matching GPRO_matmul.py configuration
     GRAD_ACC_STEPS = 16      # Matching GPRO_matmul.py configuration
     print(f"[CONFIG] Single GPU mode")
     print(f"[CONFIG] Using 4-bit quantization configuration")
