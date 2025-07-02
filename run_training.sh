@@ -91,7 +91,7 @@ GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())")
 echo "Detected $GPU_COUNT GPUs"
 
 # **4 GPU DISTRIBUTED TRAINING SETUP**
-if [ "$GPU_COUNT" -eq 4 ]; then
+if [ "$GPU_COUNT" -eq 2 ]; then
     echo "🚀 **4 GPU DISTRIBUTED TRAINING MODE**"
     echo "   - GPUs: 4x Tesla T4 (15GB each)"
     echo "   - Total VRAM: 60GB"
@@ -107,7 +107,7 @@ if [ "$GPU_COUNT" -eq 4 ]; then
     # Try torchrun first (recommended for 4 GPUs)
     echo "Launching with torchrun (recommended)..."
     torchrun \
-        --nproc_per_node=4 \
+        --nproc_per_node=2 \
         --master_port=29500 \
         --nnodes=1 \
         --node_rank=0 \
