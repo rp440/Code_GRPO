@@ -8,14 +8,19 @@ Key Features:
 4. New L1 error-based reward function:
    - Correct result: score = (10 - mul_ops)
    - Incorrect result: score = (-dist/5 - 0.2*mul_ops)
-5. 8-bit quantization for memory efficiency with 4k context length
+5. 4-bit quantization for memory efficiency with 512 token context length
 
 Configuration:
 - Set LOAD_FROM_CHECKPOINT = False to train from scratch
 - Adjust CHECKPOINT_PATH to your previous model path
 - Modify NEW_LEARNING_RATE as needed
-- Configured for 4 GPUs with distributed training
-- Uses 8-bit quantization with 4k context length
+- Configured for multi-GPU distributed training
+- Uses 4-bit quantization with 512 token context length
+
+Note: Expected Warnings:
+- You may see "Caching is incompatible with gradient checkpointing" warnings
+- These are EXPECTED and NOT errors - the model automatically handles this
+- The warnings are suppressed for cleaner output
 
 Installation Requirements:
 - Standard dependencies: pip install -U trl peft transformers datasets huggingface_hub accelerate torch bitsandbytes
@@ -38,6 +43,13 @@ import math
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import warnings
+import logging
+
+# Suppress expected gradient checkpointing warnings early
+warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
+warnings.filterwarnings("ignore", message=".*is incompatible with gradient checkpointing.*")
+logging.getLogger("transformers.models.qwen2.modeling_qwen2").setLevel(logging.ERROR)
 
 # Standard PyTorch/transformers training (no Unsloth)
 UNSLOTH_AVAILABLE = False
@@ -528,6 +540,15 @@ tokenizer_for_training = AutoTokenizer.from_pretrained(
 base_model.config.use_cache = False
 print("[FIX] Set use_cache=False to avoid gradient checkpointing conflicts")
 
+# Additional explicit cache disabling for Qwen2 layers
+if hasattr(base_model.config, 'use_cache'):
+    base_model.config.use_cache = False
+if hasattr(base_model, 'generation_config') and hasattr(base_model.generation_config, 'use_cache'):
+    base_model.generation_config.use_cache = False
+print("[FIX] Explicitly disabled caching on all model components")
+
+print("[INFO] Gradient checkpointing warnings are suppressed for cleaner output")
+
 # Configure tokenizer
 if tokenizer_for_training.pad_token is None:
     tokenizer_for_training.pad_token = tokenizer_for_training.eos_token
@@ -555,6 +576,8 @@ print("[STANDARD] Configuring gradient checkpointing")
 if USE_GRADIENT_CHECKPOINTING:
     model_peft.gradient_checkpointing_enable()
     print("[INFO] Enabled gradient checkpointing for memory efficiency")
+    print("[INFO] NOTE: You may see 'Caching is incompatible with gradient checkpointing' warnings")
+    print("[INFO] These are EXPECTED and not errors - the model automatically handles this by disabling cache")
 
 # CRITICAL: Force use_cache=False on PEFT model for GRPO compatibility
 # Known bug: GRPO/PPO fails if use_cache=True (shifts decoder_input_ids)
@@ -977,6 +1000,9 @@ print(f"  - Epochs: {training_args_grpo.num_train_epochs}")
 print(f"  - Max completion length: {training_args_grpo.max_completion_length}")
 print(f"  - Max prompt length: {training_args_grpo.max_prompt_length}")
 print(f"  - Generations per prompt: {_num_generations_per_prompt_for_reward}")
+print(f"  - Gradient checkpointing: {'Enabled' if USE_GRADIENT_CHECKPOINTING else 'Disabled'}")
+if USE_GRADIENT_CHECKPOINTING:
+    print(f"  - Note: Cache-related warnings are expected and suppressed")
 
 # Show training mode
 if 'RANK' in os.environ:

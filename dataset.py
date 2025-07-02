@@ -78,7 +78,7 @@ if __name__ == '__main__':
     # CRITICAL: Need sufficient samples for distributed training (4 GPUs)
     # Minimum: batch_size_per_gpu * num_gpus * grad_acc_steps * 10
     # For 4 GPUs with batch_size=2, grad_acc=4: 2 * 4 * 4 * 10 = 320 minimum
-    NUM_EXAMPLES_TO_GENERATE = 100  # Increased from 10 to 1000 for distributed training
+    NUM_EXAMPLES_TO_GENERATE = 100000  # Increased from 10 to 1000 for distributed training
     # Output filename suitable for the GRPO script, assuming it needs A, B, and C.
     # The GRPO script's `preprocess_jsonl_data` function expects `A_matrix_str`, `B_matrix_str`,
     # and calculates `expected_C_str` from them.
