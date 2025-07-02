@@ -373,7 +373,7 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 4   # Higher than Colab for better GPU utilization
+    BATCH_SIZE_PER_GPU = 8   # Higher than Colab for better GPU utilization
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
