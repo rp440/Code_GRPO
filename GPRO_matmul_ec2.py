@@ -902,17 +902,14 @@ distributed_args = {}
 if 'RANK' in os.environ:
     distributed_args.update({
         # CRITICAL: Disable problematic distributed features
-        "ddp_find_unused_parameters": False,
         "ddp_broadcast_buffers": False,
-        "dataloader_pin_memory": False,
         # Note: world_size, process_index, local_rank are handled automatically by torch.distributed.launch
     })
     print(f"[DISTRIBUTED] Configured for distributed training")
     print(f"[DISTRIBUTED] Environment: RANK={os.environ.get('RANK')}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
 else:
     distributed_args.update({
-        "ddp_find_unused_parameters": False,
-        "dataloader_pin_memory": False,
+        # Keep minimal for single GPU
     })
     print(f"[SINGLE GPU] Configured for single GPU training")
 
