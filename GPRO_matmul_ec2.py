@@ -40,10 +40,12 @@ from torch.utils.data.distributed import DistributedSampler
 import warnings
 import logging
 
-# Suppress expected gradient checkpointing warnings early
+# Suppress expected gradient checkpointing warnings - these are normal with Qwen2
 warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
-warnings.filterwarnings("ignore", message=".*is incompatible with gradient checkpointing.*")
+warnings.filterwarnings("ignore", message=".*is incompatible with gradient checkpointing.*") 
+warnings.filterwarnings("ignore", message=".*adient checkpointing.*")  # Catches partial messages
 logging.getLogger("transformers.models.qwen2.modeling_qwen2").setLevel(logging.ERROR)
+print("[INFO] Suppressed expected Qwen2 gradient checkpointing warnings for cleaner output")
 
 # Standard PyTorch/transformers training (no Unsloth)
 UNSLOTH_AVAILABLE = False
@@ -578,9 +580,14 @@ if hasattr(base_model.config, 'use_cache'):
     base_model.config.use_cache = False
 if hasattr(base_model, 'generation_config') and hasattr(base_model.generation_config, 'use_cache'):
     base_model.generation_config.use_cache = False
-print("[FIX] Explicitly disabled caching on all model components")
 
-print("[INFO] Gradient checkpointing warnings are suppressed for cleaner output")
+# Explicitly disable gradient checkpointing on base model if it exists
+if hasattr(base_model, 'gradient_checkpointing') and base_model.gradient_checkpointing:
+    base_model.gradient_checkpointing = False
+    print("[FIX] Disabled gradient checkpointing on base model")
+
+print("[FIX] Explicitly disabled caching on all model components")
+print("[INFO] Note: Any gradient checkpointing warnings you see are expected and harmless")
 
 # Configure tokenizer
 if tokenizer_for_training.pad_token is None:
@@ -632,6 +639,20 @@ if not LOAD_FROM_CHECKPOINT:
 # Configure gradient checkpointing and training mode
 print("[STANDARD] Using standard training mode")
 model_peft.train()
+
+# Explicitly disable gradient checkpointing on PEFT model
+if hasattr(model_peft, 'gradient_checkpointing_enable'):
+    # Don't call enable, and if it's already enabled, try to disable
+    if hasattr(model_peft, 'gradient_checkpointing') and model_peft.gradient_checkpointing:
+        model_peft.gradient_checkpointing = False
+        print("[FIX] Disabled gradient checkpointing on PEFT model")
+    
+# Force use_cache=False on all model components (critical for GRPO)
+if hasattr(model_peft, 'config'):
+    model_peft.config.use_cache = False
+if hasattr(model_peft, 'base_model') and hasattr(model_peft.base_model, 'config'):
+    model_peft.base_model.config.use_cache = False
+print("[CRITICAL FIX] Ensured use_cache=False for GRPO compatibility")
 
 # CRITICAL: Ensure all trainable parameters have gradients enabled
 trainable_params_count = 0
@@ -927,7 +948,7 @@ training_args_grpo = GRPOConfig(
     dataloader_num_workers=0,
     dataloader_prefetch_factor=None,
     # Memory optimization settings
-    gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
+    gradient_checkpointing=False,  # Explicitly disabled to prevent warnings
     max_grad_norm=MAX_GRAD_NORM,
     warmup_ratio=WARMUP_RATIO,
     # Additional GRPO settings
