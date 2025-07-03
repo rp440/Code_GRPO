@@ -1009,7 +1009,7 @@ training_args_grpo = GRPOConfig(
     max_prompt_length=256,
     logging_steps=5,
     save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
-    save_steps=100,  # Save checkpoint every 100 steps
+    save_steps=10,   # Save checkpoint every 10 steps
     logging_dir=actual_tensorboard_dir,  # TensorBoard logs to the correct directory
     report_to="tensorboard",
     push_to_hub=False,
@@ -1061,7 +1061,29 @@ trainer_grpo = GRPOTrainer(
     optimizers=(optimizer, None),  # Use our custom optimizer, no scheduler
 )
 
-print("Starting GRPO training...")
+# ---------------------------------------------
+# Checkpoint-resumption helper: if the output
+# directory already contains checkpoints
+# (e.g. "checkpoint-1230"), automatically resume
+# from the latest one.
+# ---------------------------------------------
+latest_ckpt_path = None
+if os.path.isdir(FINAL_MODEL_PATH):
+    ckpt_dirs = [d for d in os.listdir(FINAL_MODEL_PATH) if d.startswith("checkpoint-")]
+    if ckpt_dirs:
+        # Sort by global step number extracted from name
+        try:
+            ckpt_dirs.sort(key=lambda x: int(re.findall(r"\d+", x)[-1]))
+            latest_ckpt_path = os.path.join(FINAL_MODEL_PATH, ckpt_dirs[-1])
+        except Exception:
+            pass  # Fallback: ignore malformed names
+
+if latest_ckpt_path:
+    print(f"[CHECKPOINT] Resuming training from latest checkpoint: {latest_ckpt_path}")
+else:
+    print("[CHECKPOINT] No previous checkpoint found – starting fresh training")
+
+print("Starting GRPO training (with auto-resume)…")
 print(f"  - Per-device batch size: {training_args_grpo.per_device_train_batch_size}")
 print(f"  - Gradient accumulation steps: {training_args_grpo.gradient_accumulation_steps}")
 print(f"  - Total effective batch size: {TOTAL_BATCH_SIZE}")
@@ -1104,7 +1126,10 @@ print("\n=== STARTING GRPO TRAINING ===")
 print("If training hangs on 'Loading data', it's likely a memory issue...")
 
 try:
-    trainer_grpo.train()
+    if latest_ckpt_path:
+        trainer_grpo.train(resume_from_checkpoint=latest_ckpt_path)
+    else:
+        trainer_grpo.train()
     print("GRPO Training finished successfully!")
 except Exception as e:
     print(f"[ERROR] Training failed: {e}")
