@@ -53,6 +53,16 @@ except Exception as e:
     print(f'⚠️  Error: {e}')
 "
 
+# Install rclone and sync files from Google Drive
+echo "Installing rclone and syncing files from Google Drive..."
+sudo apt update && sudo apt install -y rclone
+
+# Configure rclone (interactive; skip if already configured)
+rclone config
+
+# Copy files from Google Drive to local workspace (update YOUR/DRIVE/PATH as needed)
+rclone copy gdrive:YOUR/DRIVE/PATH ./Code_GRPO/ --progress
+
 # Create necessary directories
 mkdir -p ~/matmul_outputs/models
 mkdir -p ~/matmul_outputs/tensorboard_logs

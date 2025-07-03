@@ -362,7 +362,7 @@ LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Configuration for checkpoint loading and fresh training
-CHECKPOINT_PATH = os.path.expanduser("~/previous_checkpoint")  # Path to previous LoRA checkpoint
+CHECKPOINT_PATH = os.path.expanduser("~/final_adapter_dir")  # Path to existing DSL-STF LoRA adapter
 NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
 LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
@@ -408,7 +408,7 @@ print(f"[TRAINING CONFIG] Max completion length: 512 tokens, Max prompt length: 
 print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
-  EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  I'll generate the DSL script for matrix multiplication:  
+  EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  
 <DSL>
 M1 = (A[0,0] - A[1,1]) * (B[1,0] + B[1,1])
 M2 = (A[1,0] + A[0,1]) * (B[0,1])
@@ -640,6 +640,61 @@ if not LOAD_FROM_CHECKPOINT:
 print("[STANDARD] Using standard training mode")
 model_peft.train()
 
+# =========================
+#  New PEFT Stacking Logic
+# =========================
+# The goal is to stack a fresh GRPO LoRA adapter on top of a previously trained DSL-STF
+# adapter. The DSL-STF adapter should remain FROZEN (non-trainable) while the new GRPO
+# adapter receives gradients.
+
+# Path to the already-trained DSL-STF LoRA adapter.  Update this path to point at your
+# actual adapter directory.
+STF_ADAPTER_PATH = os.path.expanduser("~/final_adapter_dir")  # <-- CHANGE ME
+
+try:
+    print(f"[STACKED PEFT] Loading frozen DSL-STF adapter from: {STF_ADAPTER_PATH}")
+    # If we already have a PeftModel, simply load another adapter into it; otherwise, create one.
+    if isinstance(model_peft, PeftModel):
+        model_peft.load_adapter(STF_ADAPTER_PATH, adapter_name="stf", is_trainable=False)
+    else:
+        model_peft = PeftModel.from_pretrained(model_peft, STF_ADAPTER_PATH, is_trainable=False)
+    print("[STACKED PEFT] Successfully loaded DSL-STF adapter (frozen).")
+except Exception as e:
+    print(f"[STACKED PEFT] WARNING: Could not load DSL-STF adapter: {e}.  Proceeding without it.")
+
+# Add the fresh GRPO adapter that we will fine-tune.
+print("[STACKED PEFT] Adding new GRPO adapter on top of (base + STF)")
+grpo_lora_config = LoraConfig(
+    task_type="CAUSAL_LM",
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    bias="none",
+)
+
+# If `model_peft` is already a PeftModel (expected) we can simply add another adapter.
+if isinstance(model_peft, PeftModel):
+    model_peft.add_adapter("grpo", grpo_lora_config)
+    model_peft.train_adapter("grpo")  # makes ONLY the GRPO adapter trainable
+    model_peft.set_adapter("grpo")
+else:
+    # Fallback – should not happen, but handle just in case.
+    model_peft = get_peft_model(model_peft, grpo_lora_config)
+
+# Explicitly freeze any parameter that does NOT belong to the GRPO adapter.
+for name, param in model_peft.named_parameters():
+    if "lora_" in name.lower():
+        param.requires_grad = ".grpo" in name.lower()
+    else:
+        param.requires_grad = False
+
+print("[STACKED PEFT] Trainable parameters after stacking:")
+model_peft.print_trainable_parameters()
+# =========================
+#  End PEFT Stacking Logic
+# =========================
+
 # Explicitly disable gradient checkpointing on PEFT model
 if hasattr(model_peft, 'gradient_checkpointing_enable'):
     # Don't call enable, and if it's already enabled, try to disable
@@ -661,7 +716,7 @@ for name, param in model_peft.named_parameters():
         trainable_params_count += 1
     else:
         # Force enable gradients for PEFT parameters
-        if any(target in name for target in ["lora_", "modules_to_save"]):
+        if 'lora_' in name.lower() and '.grpo' in name.lower():
             param.requires_grad = True
             trainable_params_count += 1
             print(f"[FIX] Enabled gradients for: {name}")
@@ -671,11 +726,11 @@ print(f"[GRADIENT CHECK] {trainable_params_count} parameters have gradients enab
 # Verify gradients are properly enabled
 if trainable_params_count == 0:
     print("[ERROR] No parameters have gradients enabled!")
-    # Force enable gradients for all LoRA parameters
+    # Force enable gradients only for the GRPO adapter parameters
     for name, param in model_peft.named_parameters():
-        if 'lora_' in name.lower():
+        if 'lora_' in name.lower() and '.grpo' in name.lower():
             param.requires_grad = True
-            print(f"[FORCE FIX] Enabled gradients for: {name}")
+            print(f"[FORCE FIX] Enabled gradients for (GRPO): {name}")
 
 model_peft.print_trainable_parameters()
 
