@@ -362,7 +362,7 @@ LOCAL_TRAINED_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, TRAINED_MODEL_DIR_NAME)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Configuration for checkpoint loading and fresh training
-CHECKPOINT_PATH = os.path.expanduser("~/final_adapter_dir")  # Path to existing DSL-STF LoRA adapter
+CHECKPOINT_PATH = "./final_adapter"  # Path to existing DSL-STF LoRA adapter (updated)
 NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
 LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
@@ -373,14 +373,14 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 8   # Higher than Colab for better GPU utilization
+    BATCH_SIZE_PER_GPU = 16  # doubled batch size per GPU for faster training
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4   # Higher than Colab for better GPU utilization
+    BATCH_SIZE_PER_GPU = 8   # doubled batch size per GPU for faster training
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Single GPU mode")
     print(f"[CONFIG] Standard training configuration")
@@ -649,7 +649,7 @@ model_peft.train()
 
 # Path to the already-trained DSL-STF LoRA adapter.  Update this path to point at your
 # actual adapter directory.
-STF_ADAPTER_PATH = os.path.expanduser("~/final_adapter_dir")  # <-- CHANGE ME
+STF_ADAPTER_PATH = "./final_adapter"  # path to frozen DSL-STF LoRA adapter
 
 try:
     print(f"[STACKED PEFT] Loading frozen DSL-STF adapter from: {STF_ADAPTER_PATH}")
