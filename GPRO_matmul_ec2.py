@@ -103,8 +103,24 @@ class DSLExecutor:
                 self.variables[f'A[{r_idx},{c_idx}]'] = matrix_a[r_idx][c_idx]
                 self.variables[f'B[{r_idx},{c_idx}]'] = matrix_b[r_idx][c_idx]
 
+    # ------------------------------------------------------
+    # Helper: canonicalize a DSL variable name so that minor
+    # spacing / case differences (e.g. "a[0, 1]", "C[1, 0]")
+    # no longer break execution.
+    # ------------------------------------------------------
+    def _canonicalize_var_name(self, name: str) -> str:
+        name = name.strip()
+        # Upper-case first letter (so a→A, b→B, c→C, m→M, etc.)
+        if name and name[0].isalpha():
+            name = name[0].upper() + name[1:]
+        # Remove optional spaces inside the [row,col] indices
+        name = re.sub(r'\[\s*(\d+)\s*,\s*(\d+)\s*\]', r'[\1,\2]', name)
+        return name
+
     def _get_value(self, var_name):
+        var_name = self._canonicalize_var_name(var_name)
         try:
+            # Attempt literal eval first (for numeric constants or lists)
             return ast.literal_eval(var_name)
         except (ValueError, SyntaxError, TypeError):
             if var_name not in self.variables:
@@ -114,15 +130,21 @@ class DSLExecutor:
     def execute_step(self, step_line):
         original_step_line = step_line
         step_line = step_line.strip()
+        # Allow users to end statements with a semicolon, e.g. "C[0,0] = ...;"
+        if step_line.endswith(';'):
+            step_line = step_line[:-1].rstrip()
         if not step_line: return
         if '=' not in step_line:
             raise ValueError(f"Malformed DSL step (missing '='): '{original_step_line}'")
 
         target_var, expression = [s.strip() for s in step_line.split('=', 1)]
         
+        # Canonicalize target variable name to maintain consistency (e.g. C[0, 0] -> C[0,0])
+        target_var_canon = self._canonicalize_var_name(target_var)
+        
         # Handle chained operations (e.g., M1 + M4 - M5 + M7)
         result = self._evaluate_expression(expression, original_step_line)
-        self.variables[target_var] = result
+        self.variables[target_var_canon] = result
     
     def _evaluate_expression(self, expression, original_step_line):
         """Evaluate an expression that may contain chained +/- operations or complex parenthetical expressions"""
@@ -225,7 +247,8 @@ class DSLExecutor:
         
         # First term (no leading operator)
         first_term = tokens[0].strip()
-        result = self._get_value(first_term)
+        # Allow the first term to be a complex expression (e.g., contains '*')
+        result = self._evaluate_expression(first_term, original_step_line) if ('*' in first_term or '+' in first_term or '-' in first_term[1:]) else self._get_value(first_term)
         
         # Process remaining terms with their operators
         i = 1
@@ -240,7 +263,8 @@ class DSLExecutor:
                 i += 2
                 continue
                 
-            value = self._get_value(operand)
+            # Recursively evaluate the operand so it can itself be a multiplication or parenthetical expr
+            value = self._evaluate_expression(operand, original_step_line) if ('*' in operand or '+' in operand or '-' in operand[1:]) else self._get_value(operand)
             
             if operator == '+': 
                 result += value
@@ -373,7 +397,7 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 8   # reduced batch size due to 1024-token completions
+    BATCH_SIZE_PER_GPU = 16   # reduced batch size due to 1024-token completions
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
@@ -1075,6 +1099,7 @@ if os.path.isdir(FINAL_MODEL_PATH):
         try:
             ckpt_dirs.sort(key=lambda x: int(re.findall(r"\d+", x)[-1]))
             latest_ckpt_path = os.path.join(FINAL_MODEL_PATH, ckpt_dirs[-1])
+            print(f"[CHECKPOINT] Existing checkpoint directories: {ckpt_dirs}")
         except Exception:
             pass  # Fallback: ignore malformed names
 
@@ -1131,6 +1156,14 @@ try:
     else:
         trainer_grpo.train()
     print("GRPO Training finished successfully!")
+
+    # ---- Post-training checkpoint sanity print ----
+    try:
+        final_ckpts = [d for d in os.listdir(FINAL_MODEL_PATH) if d.startswith("checkpoint-")]
+        print(f"[CHECKPOINT] After training, checkpoints present: {final_ckpts}")
+    except Exception as e:
+        print(f"[CHECKPOINT] Warning: could not list checkpoint directories ({e})")
+
 except Exception as e:
     print(f"[ERROR] Training failed: {e}")
     print("Try reducing batch size further or using a smaller model")

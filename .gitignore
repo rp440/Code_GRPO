@@ -53,6 +53,7 @@ checkpoints/
 models/
 *.model
 *.ckpt
+checkpoint-*/
 
 # Datasets
 *.jsonl
