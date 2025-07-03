@@ -1004,7 +1004,7 @@ training_args_grpo = GRPOConfig(
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # Training configuration settings
-    max_completion_length=1024,
+    max_completion_length=750,
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=256,
     logging_steps=5,
