@@ -61,7 +61,7 @@ sudo apt update && sudo apt install -y rclone
 rclone config
 
 # Copy files from Google Drive to local workspace (update YOUR/DRIVE/PATH as needed)
-rclone copy gdrive:YOUR/DRIVE/PATH ./Code_GRPO/ --progress
+rclone copy gdrive:/content/drive/MyDrive/Qwen_DSL_FineTune_random/qwen_dsl_finetuned_adapter/final_adapter ./Code_GRPO/ --progress
 
 # Create necessary directories
 mkdir -p ~/matmul_outputs/models
