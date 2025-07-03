@@ -397,7 +397,7 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 16   # reduced batch size due to 1024-token completions
+    BATCH_SIZE_PER_GPU = 12   # reduced batch size due to 1024-token completions
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
