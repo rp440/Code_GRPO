@@ -1086,27 +1086,38 @@ trainer_grpo = GRPOTrainer(
 )
 
 # ---------------------------------------------
-# Checkpoint-resumption helper: if the output
-# directory already contains checkpoints
-# (e.g. "checkpoint-1230"), automatically resume
-# from the latest one.
+# Checkpoint-resumption helper: scan EVERY run directory inside
+# matmul_outputs/models/ and pick the highest-step `checkpoint-*`.
+# This makes resumption independent of batch size, GPU count, etc.
 # ---------------------------------------------
-latest_ckpt_path = None
-if os.path.isdir(FINAL_MODEL_PATH):
-    ckpt_dirs = [d for d in os.listdir(FINAL_MODEL_PATH) if d.startswith("checkpoint-")]
-    if ckpt_dirs:
-        # Sort by global step number extracted from name
-        try:
-            ckpt_dirs.sort(key=lambda x: int(re.findall(r"\d+", x)[-1]))
-            latest_ckpt_path = os.path.join(FINAL_MODEL_PATH, ckpt_dirs[-1])
-            print(f"[CHECKPOINT] Existing checkpoint directories: {ckpt_dirs}")
-        except Exception:
-            pass  # Fallback: ignore malformed names
+
+def _find_latest_checkpoint(base_models_dir: str):
+    """Return path to checkpoint with the largest global step under base_models_dir."""
+    latest_ckpt = None
+    latest_step = -1
+    for run_name in os.listdir(base_models_dir):
+        run_dir = os.path.join(base_models_dir, run_name)
+        if not os.path.isdir(run_dir):
+            continue
+        for entry in os.listdir(run_dir):
+            if not entry.startswith("checkpoint-"):
+                continue
+            try:
+                step_num = int(re.findall(r"\d+", entry)[-1])
+            except (IndexError, ValueError):
+                continue
+            if step_num > latest_step:
+                latest_step = step_num
+                latest_ckpt = os.path.join(run_dir, entry)
+    return latest_ckpt
+
+# Scan for newest checkpoint across ALL runs
+latest_ckpt_path = _find_latest_checkpoint(MODEL_SAVE_DIR)
 
 if latest_ckpt_path:
-    print(f"[CHECKPOINT] Resuming training from latest checkpoint: {latest_ckpt_path}")
+    print(f"[CHECKPOINT] Latest checkpoint found: {latest_ckpt_path}")
 else:
-    print("[CHECKPOINT] No previous checkpoint found – starting fresh training")
+    print("[CHECKPOINT] No checkpoint found – starting fresh training")
 
 print("Starting GRPO training (with auto-resume)…")
 print(f"  - Per-device batch size: {training_args_grpo.per_device_train_batch_size}")
