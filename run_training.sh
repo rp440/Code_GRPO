@@ -31,6 +31,9 @@ pip install --upgrade pip wheel
     # Install vLLM for optimized inference
     pip install "vllm>=0.8.5"
 
+    # Install gdown for downloading files from Google Drive
+    pip install gdown
+
 
 # Verify installations
 python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
@@ -53,15 +56,11 @@ except Exception as e:
     print(f'⚠️  Error: {e}')
 "
 
-# Install rclone and sync files from Google Drive
-echo "Installing rclone and syncing files from Google Drive..."
-sudo apt update && sudo apt install -y rclone
-
-# Configure rclone (interactive; skip if already configured)
-rclone config
-
-# Copy files from Google Drive to local workspace (update YOUR/DRIVE/PATH as needed)
-rclone copy gdrive:/content/drive/MyDrive/Qwen_DSL_FineTune_random/qwen_dsl_finetuned_adapter/final_adapter ./Code_GRPO/ --progress
+# Download adapter files from Google Drive using gdown
+echo "Downloading adapter files from Google Drive..."
+# Ensure gdown is available (installed in the virtual environment above)
+mkdir final_adapter
+gdown --folder https://drive.google.com/drive/folders/1bnQEqN-ZvRCeaJ--heMOUliFZL87N9eD?usp=drive_link -O ./final_adapter --progress
 
 # Create necessary directories
 mkdir -p ~/matmul_outputs/models
