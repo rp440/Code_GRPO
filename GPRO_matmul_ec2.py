@@ -904,6 +904,10 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
 
         lines = dsl_content.split('\n')
         cleaned_lines = [line.strip() for line in lines if line.strip()]
+        # If the DSL tags were present but contain no valid lines, do NOT award the tag bonus
+        if not cleaned_lines:
+            tag_bonus = 0.0  # No bonus for empty DSL content
+            print(f"  Completion {i}: [WARNING] <DSL> tags are empty – tag bonus removed")
         final_dsl_script = "\n".join(cleaned_lines)
 
         if not final_dsl_script or final_dsl_script.strip().lower() == "error: cannot determine full sequence.":
