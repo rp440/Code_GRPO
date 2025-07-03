@@ -373,14 +373,14 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 16  # doubled batch size per GPU for faster training
+    BATCH_SIZE_PER_GPU = 8   # reduced batch size due to 1024-token completions
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 8   # doubled batch size per GPU for faster training
+    BATCH_SIZE_PER_GPU = 4   # reduced batch size due to 1024-token completions
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Single GPU mode")
     print(f"[CONFIG] Standard training configuration")
@@ -1000,7 +1000,7 @@ training_args_grpo = GRPOConfig(
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # Training configuration settings
-    max_completion_length=512,
+    max_completion_length=1024,
     num_generations=_num_generations_per_prompt_for_reward,
     max_prompt_length=256,
     logging_steps=5,
