@@ -676,8 +676,23 @@ grpo_lora_config = LoraConfig(
 # If `model_peft` is already a PeftModel (expected) we can simply add another adapter.
 if isinstance(model_peft, PeftModel):
     model_peft.add_adapter("grpo", grpo_lora_config)
-    model_peft.train_adapter("grpo")  # makes ONLY the GRPO adapter trainable
-    model_peft.set_adapter("grpo")
+    # Attempt to make ONLY the GRPO adapter trainable using the PEFT helper.
+    try:
+        model_peft.train_adapter("grpo")  # Preferred API (PEFT ≥0.6)
+    except AttributeError:
+        print("[STACKED PEFT] 'train_adapter' not found in current PEFT version – falling back to manual gradient control.")
+        # Manually enable gradients for GRPO LoRA parameters only; others stay frozen.
+        for name, param in model_peft.named_parameters():
+            if "lora_" in name.lower():
+                param.requires_grad = ".grpo" in name.lower()
+            else:
+                param.requires_grad = False
+
+    # Activate the GRPO adapter for forward passes.
+    try:
+        model_peft.set_adapter("grpo")
+    except AttributeError:
+        print("[STACKED PEFT] 'set_adapter' not found in current PEFT version – continuing without explicit activation.")
 else:
     # Fallback – should not happen, but handle just in case.
     model_peft = get_peft_model(model_peft, grpo_lora_config)
