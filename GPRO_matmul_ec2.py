@@ -39,6 +39,64 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import warnings
 import logging
+from dataclasses import dataclass
+from transformers import TrainerCallback
+
+# ==============================================
+#  CENTRAL TRAINING CONFIGURATION (ONE-STOP VIEW)
+# ==============================================
+@dataclass
+class TrainConfig:
+    """All tunable knobs for GRPO training & sampling."""
+    # --- core hyper-parameters ---
+    learning_rate: float = 2e-6
+    epochs: int = 1
+    grad_acc_steps: int = 16
+
+    # --- batch / sequence lengths ---
+    batch_size_per_gpu: int = 12
+    max_completion_length: int = 750
+    max_prompt_length: int = 256
+
+    # --- generation / exploration ---
+    num_generations: int = 4
+    temperature: float = 1.0  # used when sampling completions
+
+    # ---------- new exploration levers ----------
+    beta: float = 0.01           # KL penalty coefficient
+    scale_rewards: bool = False  # disable reward scaling
+    top_k: int = 0              # sampling parameters
+    top_p: float = 1.0
+
+    # reward shaping
+    shaping_coeff: float = -0.1  # additional per-multiplication penalty
+
+    # ---------- advanced GRPO hyper-params ----------
+    epsilon: float = 0.2                        # PPO-style ratio clip
+    epsilon_high: float = 0.3                  # upper clip for two-sided clipping
+    delta: float = 0.3                         # alt name used in some versions
+    loss_type: str = "bnpo"                   # switch to "dr_grpo" to reduce length bias
+    mask_truncated_completions: bool = True    # ignore sequences that hit max tokens in loss
+    num_iterations: int = 1                    # μ optimisation steps per batch
+    generation_batch_size: int | None = None   # oversampling knob
+    steps_per_generation: int | None = None    # decouples sampling from optimisation
+    disable_dropout: bool = True               # eliminates stochastic KL noise
+
+    # --- logging / checkpointing ---
+    logging_steps: int = 5
+    save_steps: int = 10
+    warmup_steps: int = 2
+    warmup_ratio: float = 0.05
+
+# Instantiate a global so the rest of the script can reference it
+CFG = TrainConfig()
+
+# Convenience aliases so existing variables continue to work
+NEW_LEARNING_RATE = CFG.learning_rate
+EPOCHS = CFG.epochs
+GRAD_ACC_STEPS = CFG.grad_acc_steps
+
+_num_generations_per_prompt_for_reward = CFG.num_generations  # override default
 
 # Suppress expected gradient checkpointing warnings - these are normal with Qwen2
 warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
@@ -387,7 +445,7 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Configuration for checkpoint loading and fresh training
 CHECKPOINT_PATH = "./final_adapter"  # Path to existing DSL-STF LoRA adapter (updated)
-NEW_LEARNING_RATE = 2e-5 # Learning rate for fresh optimizer
+NEW_LEARNING_RATE = 2e-6 # Learning rate for fresh optimizer
 LOAD_FROM_CHECKPOINT = True  # Set to False to train from scratch
 
 # Training configuration - Auto-detect distributed vs single GPU
@@ -404,7 +462,7 @@ if 'WORLD_SIZE' in os.environ:
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4   # reduced batch size due to 1024-token completions
+    BATCH_SIZE_PER_GPU = 4   # reduced batch size due to 1024-token completions (single-GPU)
     GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Single GPU mode")
     print(f"[CONFIG] Standard training configuration")
@@ -946,6 +1004,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
         try:
             # Count multiplications more accurately
             num_multiplications = count_multiplications_in_dsl(final_dsl_script)
+            shaping_term = CFG.shaping_coeff * num_multiplications
             
             # Execute DSL
             executor = DSLExecutor(A, B)
@@ -955,6 +1014,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
             if C_dsl == expected_C:
                 # Correct answer: penalty only for number of multiplications
                 reward = num_multiplications * MULT_PENALTY  # -1 per multiplication
+                reward += shaping_term
                 print(f"  Completion {i}: **CORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 
                 if num_multiplications < _best_n_mults:
@@ -965,6 +1025,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
             else:
                 # Wrong answer: large penalty
                 reward = WRONG_ANSWER_PENALTY  # -100
+                reward += (num_multiplications * MULT_PENALTY) + shaping_term
                 print(f"  Completion {i}: **INCORRECT** {num_multiplications}-mult, reward={reward:.1f}")
                 print(f"  Completion {i}: Expected: {expected_C}, Got: {C_dsl}")
 
@@ -975,7 +1036,7 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
             print(f"  Completion {i}: Wrong answer penalty: {reward:.1f}")
         
         # Final reward with tag bonus
-        final_reward = reward + tag_bonus
+        final_reward = reward + tag_bonus  # tag bonus added after shaping already in reward
         rewards.append(final_reward)
         
         if tag_bonus > 0:
@@ -988,6 +1049,44 @@ def matrix_dsl_reward(completions, prompts=None, completion_ids=None, **kwargs):
     print("=" * 50)
     
     return rewards
+
+# ==================================================
+#  Metric Logger Callback – prints exploration stats
+# ==================================================
+class ExplorationMetricCallback(TrainerCallback):
+    """Logs entropy, KL, and advantage mean each time trainer logs."""
+    def __init__(self):
+        self.initial_entropy = None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        entropy = None
+        kl = None
+        adv = None
+        # try common keys
+        for k, v in logs.items():
+            lk = k.lower()
+            if 'entropy' in lk and entropy is None:
+                entropy = v
+            if ('kl' in lk or 'kl_div' in lk) and kl is None:
+                kl = v
+            if 'advantage' in lk and adv is None:
+                adv = v
+        # store initial entropy
+        if entropy is not None and self.initial_entropy is None:
+            self.initial_entropy = entropy
+        # Build message
+        msg_parts = []
+        if entropy is not None and self.initial_entropy is not None:
+            ratio = 100.0 * entropy / (self.initial_entropy + 1e-8)
+            msg_parts.append(f"Entropy {entropy:.3f} ({ratio:.1f}% of start)")
+        if kl is not None:
+            msg_parts.append(f"KL {kl:.3f}")
+        if adv is not None:
+            msg_parts.append(f"Adv ⌀ {adv:.3f}")
+        if msg_parts:
+            print("[METRICS] " + " | ".join(msg_parts))
 
 # --- 7. Training Arguments and GRPOTrainer ---
 print("Configuring training arguments for GRPO...")
@@ -1028,24 +1127,39 @@ training_args_grpo = GRPOConfig(
     fp16=use_fp16,
     per_device_train_batch_size=BATCH_SIZE_PER_GPU,
     # Training configuration settings
-    max_completion_length=750,
-    num_generations=_num_generations_per_prompt_for_reward,
-    max_prompt_length=256,
-    logging_steps=5,
+    max_completion_length=CFG.max_completion_length,
+    num_generations=CFG.num_generations,
+    temperature=CFG.temperature,
+    top_k=CFG.top_k,
+    top_p=CFG.top_p,
+    beta=CFG.beta,
+    scale_reward=CFG.scale_rewards,
+    max_prompt_length=CFG.max_prompt_length,
+    logging_steps=CFG.logging_steps,
     save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
-    save_steps=10,   # Save checkpoint every 10 steps
+    save_steps=CFG.save_steps,   # Save checkpoint every N steps
     logging_dir=actual_tensorboard_dir,  # TensorBoard logs to the correct directory
     report_to="tensorboard",
     push_to_hub=False,
     dataloader_drop_last=True,  # Changed to True to ensure consistent batches
-    warmup_steps=2,
+    warmup_steps=CFG.warmup_steps,
     # Data loading configuration
     dataloader_num_workers=0,
     dataloader_prefetch_factor=None,
     # Memory optimization settings
     gradient_checkpointing=False,  # Explicitly disabled to prevent warnings
     max_grad_norm=MAX_GRAD_NORM,
-    warmup_ratio=WARMUP_RATIO,
+    warmup_ratio=CFG.warmup_ratio,
+    # --- advanced GRPO knobs ---
+    epsilon=CFG.epsilon,
+    epsilon_high=CFG.epsilon_high,
+    delta=CFG.delta,
+    loss_type=CFG.loss_type,
+    mask_truncated_completions=CFG.mask_truncated_completions,
+    num_iterations=CFG.num_iterations,
+    generation_batch_size=CFG.generation_batch_size,
+    steps_per_generation=CFG.steps_per_generation,
+    disable_dropout=CFG.disable_dropout,
     # Additional GRPO settings
     group_by_length=False,
     dataloader_pin_memory=False,
@@ -1083,6 +1197,7 @@ trainer_grpo = GRPOTrainer(
     args=training_args_grpo,
     train_dataset=train_dataset_for_grpo,
     optimizers=(optimizer, None),  # Use our custom optimizer, no scheduler
+    callbacks=[ExplorationMetricCallback()],
 )
 
 # ---------------------------------------------
@@ -1245,8 +1360,9 @@ outputs = text_gen_pipeline(
     formatted_inference_prompt, 
     max_new_tokens=350, 
     do_sample=False, 
-    temperature=0.1, 
-    top_p=0.9,
+    temperature=CFG.temperature,
+    top_p=CFG.top_p,
+    top_k=CFG.top_k,
     pad_token_id=inference_tokenizer.pad_token_id, 
     eos_token_id=inference_tokenizer.eos_token_id
 )
