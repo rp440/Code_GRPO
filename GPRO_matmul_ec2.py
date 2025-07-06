@@ -712,7 +712,7 @@ if not LOAD_FROM_CHECKPOINT:
     for name, param in model_peft.named_parameters():
         if 'lora_' in name.lower():
             param.requires_grad = True
-            print(f"[PEFT SETUP] Enabled: {name}")
+            # print(f"[PEFT SETUP] Enabled: {name}")  # Suppressed verbose per-parameter log
     
     # Verify PEFT setup
     trainable_count = sum(1 for p in model_peft.parameters() if p.requires_grad)
@@ -1133,7 +1133,7 @@ training_args_grpo = GRPOConfig(
     top_k=CFG.top_k,
     top_p=CFG.top_p,
     beta=CFG.beta,
-    scale_reward=CFG.scale_rewards,
+    scale_rewards=CFG.scale_rewards,
     max_prompt_length=CFG.max_prompt_length,
     logging_steps=CFG.logging_steps,
     save_strategy="steps",  # Change to steps for checkpoint saving every 100 steps
