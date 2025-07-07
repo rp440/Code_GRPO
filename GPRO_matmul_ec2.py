@@ -54,30 +54,30 @@ class TrainConfig:
     grad_acc_steps: int = 16
 
     # --- batch / sequence lengths ---
-    batch_size_per_gpu: int = 12
+    batch_size_per_gpu: int = 6
     max_completion_length: int = 750
     max_prompt_length: int = 256
 
     # --- generation / exploration ---
-    num_generations: int = 4
-    temperature: float = 1.0  # used when sampling completions
+    num_generations: int = 8                 # increased exploration depth
+    temperature: float = 1.4                 # higher entropy for exploration
 
     # ---------- new exploration levers ----------
     beta: float = 0.01           # KL penalty coefficient
     scale_rewards: bool = False  # disable reward scaling
-    top_k: int = 0              # sampling parameters
-    top_p: float = 1.0
+    top_k: int | None = None     # allow disabling top-k sampling
+    top_p: float = 0.95          # nucleus sampling threshold
 
     # reward shaping
     shaping_coeff: float = -0.1  # additional per-multiplication penalty
 
     # ---------- advanced GRPO hyper-params ----------
     epsilon: float = 0.2                        # PPO-style ratio clip
-    epsilon_high: float = 0.3                  # upper clip for two-sided clipping
+    epsilon_high: float = 0.28                 # tighter two-sided clip
     delta: float = 0.3                         # alt name used in some versions
-    loss_type: str = "bnpo"                   # switch to "dr_grpo" to reduce length bias
+    loss_type: str = "dr_grpo"                # use DR-GRPO to reduce length bias
     mask_truncated_completions: bool = True    # ignore sequences that hit max tokens in loss
-    num_iterations: int = 1                    # μ optimisation steps per batch
+    num_iterations: int = 2                    # more inner optimisation steps
     generation_batch_size: int | None = None   # oversampling knob
     steps_per_generation: int | None = None    # decouples sampling from optimisation
     disable_dropout: bool = True               # eliminates stochastic KL noise
@@ -88,6 +88,11 @@ class TrainConfig:
     warmup_steps: int = 2
     warmup_ratio: float = 0.05
 
+    # --- verbose logging helpers ---
+    log_completions: bool = True
+    num_completions_to_print: int = 2
+    token_entropy_percentile_threshold: float = 0.05
+
 # Instantiate a global so the rest of the script can reference it
 CFG = TrainConfig()
 
@@ -96,7 +101,7 @@ NEW_LEARNING_RATE = CFG.learning_rate
 EPOCHS = CFG.epochs
 GRAD_ACC_STEPS = CFG.grad_acc_steps
 
-_num_generations_per_prompt_for_reward = CFG.num_generations  # override default
+_num_generations_per_prompt_for_reward = CFG.num_generations  # synced with config
 
 # Suppress expected gradient checkpointing warnings - these are normal with Qwen2
 warnings.filterwarnings("ignore", message=".*Caching is incompatible with gradient checkpointing.*")
@@ -877,7 +882,7 @@ model_peft.config.pad_token_id = tokenizer_for_training.eos_token_id
 
 # --- 6. Reward Function for GRPO ---
 # CRITICAL: GRPO requires multiple generations per prompt for preference learning
-_num_generations_per_prompt_for_reward = 4  # MUST be >= 2 for GRPO to work effectively
+_num_generations_per_prompt_for_reward = CFG.num_generations  # synced with TrainConfig (must be >= 2)
 _reward_call_count = 0
 _best_n_mults = float('inf')  # Track the best number of multiplications found so far
 
@@ -1165,6 +1170,10 @@ training_args_grpo = GRPOConfig(
     dataloader_pin_memory=False,
     ddp_find_unused_parameters=False,
     torch_compile=False,
+    # --- logging helpers ---
+    log_completions=CFG.log_completions,
+    num_completions_to_print=CFG.num_completions_to_print,
+    token_entropy_percentile_threshold=CFG.token_entropy_percentile_threshold,
     # Apply distributed configuration
     **distributed_args,
 )

@@ -12,28 +12,29 @@
 # Activate virtual environment
 source ./myproject311/bin/activate
 
-# Update pip and install wheel
-pip install --upgrade pip wheel
+# Install uv (fast Python package manager) and wheel
+python3 -m pip install --upgrade uv wheel
 
-# Option 1: Install from frozen requirements (recommended for exact reproducibility)
-# if [ -f "requirements.txt" ]; then
-#     echo "Installing from frozen requirements.txt for exact reproducibility..."
-#     pip install -r requirements.txt
-# else
-#     echo "requirements.txt not found, installing packages individually..."
-    
-    # Install PyTorch with CUDA 12.1 (compatible with your CUDA 12.8 system)
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Initialize a uv project (creates pyproject.toml) if not already present
+if [ ! -d "myproject" ]; then
+    uv init myproject
+fi
+cd myproject
 
-    # Install required packages
-    pip install transformers peft datasets trl tensorboard accelerate bitsandbytes
+# Install PyTorch with CUDA 12.1 (compatible with your CUDA 12.8 system)
+uv add torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-    # Install vLLM for optimized inference
-    pip install "vllm>=0.8.5"
+# Install required packages
+uv add transformers peft datasets trl tensorboard accelerate bitsandbytes
 
-    # Install gdown for downloading files from Google Drive
-    pip install gdown
+# Install vLLM for optimized inference
+uv add "vllm>=0.8.5"
 
+# Install gdown for downloading files from Google Drive
+uv add gdown
+
+# Return to project root so subsequent scripts run correctly
+cd ..
 
 # Verify installations
 python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
