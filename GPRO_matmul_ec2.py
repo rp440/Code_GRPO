@@ -54,7 +54,8 @@ class TrainConfig:
     grad_acc_steps: int = 16
 
     # --- batch / sequence lengths ---
-    batch_size_per_gpu: int = 6
+    BATCH_SIZE_PER_GPU = 6   # reduced batch size due to 1024-token completions
+    GRAD_ACC_STEPS = 8 
     max_completion_length: int = 750
     max_prompt_length: int = 256
 
@@ -460,15 +461,15 @@ EPOCHS = 1
 if 'WORLD_SIZE' in os.environ:
     # Multi-GPU distributed training
     NUM_GPUS = int(os.environ['WORLD_SIZE'])
-    BATCH_SIZE_PER_GPU = 12   # reduced batch size due to 1024-token completions
-    GRAD_ACC_STEPS = 16      # Keep same effective batch size
+    # BATCH_SIZE_PER_GPU = 6   # reduced batch size due to 1024-token completions
+    # GRAD_ACC_STEPS = 8      # Keep same effective batch size
     print(f"[CONFIG] Multi-GPU mode detected: {NUM_GPUS} GPUs")
     print(f"[CONFIG] Distributed training configuration")
 else:
     # Single GPU training
     NUM_GPUS = 1
-    BATCH_SIZE_PER_GPU = 4   # reduced batch size due to 1024-token completions (single-GPU)
-    GRAD_ACC_STEPS = 16      # Keep same effective batch size
+    # BATCH_SIZE_PER_GPU = 4   # reduced batch size due to 1024-token completions (single-GPU)
+    # GRAD_ACC_STEPS = 16      # Keep same effective batch size
     print(f"[CONFIG] Single GPU mode")
     print(f"[CONFIG] Standard training configuration")
 
