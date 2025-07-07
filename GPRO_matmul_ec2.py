@@ -1171,9 +1171,8 @@ training_args_grpo = GRPOConfig(
     ddp_find_unused_parameters=False,
     torch_compile=False,
     # --- logging helpers ---
-    log_completions=CFG.log_completions,
-    num_completions_to_print=CFG.num_completions_to_print,
-    token_entropy_percentile_threshold=CFG.token_entropy_percentile_threshold,
+    # log_completions=CFG.log_completions,
+    # num_completions_to_print=CFG.num_completions_to_print,
     # Apply distributed configuration
     **distributed_args,
 )
