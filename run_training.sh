@@ -61,7 +61,7 @@ except Exception as e:
 echo "Downloading adapter files from Google Drive..."
 # Ensure gdown is available (installed in the virtual environment above)
 mkdir final_adapter
-gdown --folder https://drive.google.com/drive/folders/1bnQEqN-ZvRCeaJ--heMOUliFZL87N9eD?usp=drive_link -O ./final_adapter --progress
+gdown --folder https://drive.google.com/drive/folders/1bnQEqN-ZvRCeaJ--heMOUliFZL87N9eD?usp=drive_link -O ./final_adapter
 
 # Create necessary directories
 mkdir -p ~/matmul_outputs/models
