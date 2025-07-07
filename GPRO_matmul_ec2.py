@@ -51,11 +51,10 @@ class TrainConfig:
     # --- core hyper-parameters ---
     learning_rate: float = 2e-6
     epochs: int = 1
-    grad_acc_steps: int = 16
+    grad_acc_steps: int = 8
 
     # --- batch / sequence lengths ---
-    BATCH_SIZE_PER_GPU = 6   # reduced batch size due to 1024-token completions
-    GRAD_ACC_STEPS = 8 
+    batch_size_per_gpu: int = 6   # reduced batch size due to 1024-token completions
     max_completion_length: int = 750
     max_prompt_length: int = 256
 
@@ -100,7 +99,6 @@ CFG = TrainConfig()
 # Convenience aliases so existing variables continue to work
 NEW_LEARNING_RATE = CFG.learning_rate
 EPOCHS = CFG.epochs
-GRAD_ACC_STEPS = CFG.grad_acc_steps
 
 _num_generations_per_prompt_for_reward = CFG.num_generations  # synced with config
 
@@ -474,15 +472,15 @@ else:
     print(f"[CONFIG] Standard training configuration")
 
 # Calculate total batch size
-TOTAL_BATCH_SIZE = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS
-print(f"[CONFIG] Batch size: {BATCH_SIZE_PER_GPU}, Gradient accumulation: {GRAD_ACC_STEPS}")
+TOTAL_BATCH_SIZE = CFG.batch_size_per_gpu * NUM_GPUS * CFG.grad_acc_steps
+print(f"[CONFIG] Batch size: {CFG.batch_size_per_gpu}, Gradient accumulation: {CFG.grad_acc_steps}")
 
 # Memory optimization settings
 USE_GRADIENT_CHECKPOINTING = False  # Disabled to avoid gradient issues with PEFT
 MAX_GRAD_NORM = 0.5
 WARMUP_RATIO = 0.05
 
-model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{GRAD_ACC_STEPS}_gpu{NUM_GPUS}_t4"
+model_config_desc = f"lr{NEW_LEARNING_RATE}_epochs{EPOCHS}_batch{TOTAL_BATCH_SIZE}_gradacc{CFG.grad_acc_steps}_gpu{NUM_GPUS}_t4"
 model_name = f"{TRAINED_MODEL_DIR_NAME}_{model_config_desc}_{timestamp}"
 tensorboard_name = f"runs_{model_config_desc}_{timestamp}"
 
@@ -491,9 +489,9 @@ FINAL_TENSORBOARD_PATH = os.path.join(TENSORBOARD_LOGS_DIR, tensorboard_name)
 
 print(f"[SAVE CONFIG] Model will be saved to: {FINAL_MODEL_PATH}")
 print(f"[SAVE CONFIG] TensorBoard logs will be saved to: {FINAL_TENSORBOARD_PATH}")
-print(f"[GPU CONFIG] Using {NUM_GPUS} GPU(s) with {BATCH_SIZE_PER_GPU} batch size per GPU")
+print(f"[GPU CONFIG] Using {NUM_GPUS} GPU(s) with {CFG.batch_size_per_gpu} batch size per GPU")
 print(f"[TRAINING CONFIG] Max completion length: 512 tokens, Max prompt length: 256 tokens")
-print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={BATCH_SIZE_PER_GPU} × grad_acc={GRAD_ACC_STEPS})")
+print(f"[TRAINING CONFIG] Effective batch size: {TOTAL_BATCH_SIZE} (batch_size={CFG.batch_size_per_gpu} × grad_acc={CFG.grad_acc_steps})")
 
 SYSTEM_MESSAGE = """You are an AI assistant specialized in generating Domain Specific Language (DSL) scripts for 2x2 matrix multiplication. You can provide explanations, but must wrap your DSL code in <DSL></DSL> tags.
   EXAMPLE DSL OUTPUT FORMAT: For matrices A=[[1,2],[3,4]] and B=[[5,6],[7,8]], a valid response would be:  
@@ -1127,11 +1125,11 @@ training_args_grpo = GRPOConfig(
     output_dir=FINAL_MODEL_PATH,
     learning_rate=NEW_LEARNING_RATE,  # Use the configurable learning rate
     remove_unused_columns=False,
-    gradient_accumulation_steps=GRAD_ACC_STEPS,
+    gradient_accumulation_steps=CFG.grad_acc_steps,
     num_train_epochs=EPOCHS,
     bf16=use_bf16, 
     fp16=use_fp16,
-    per_device_train_batch_size=BATCH_SIZE_PER_GPU,
+    per_device_train_batch_size=CFG.batch_size_per_gpu,
     # Training configuration settings
     max_completion_length=CFG.max_completion_length,
     num_generations=CFG.num_generations,
@@ -1190,7 +1188,7 @@ if len(train_dataset_for_grpo) == 0:
     exit()
 
 # Check if dataset is sufficient for distributed training
-min_samples_needed = BATCH_SIZE_PER_GPU * NUM_GPUS * GRAD_ACC_STEPS * 2
+min_samples_needed = CFG.batch_size_per_gpu * NUM_GPUS * CFG.grad_acc_steps * 2
 if len(train_dataset_for_grpo) < min_samples_needed:
     print(f"[WARNING] Dataset size ({len(train_dataset_for_grpo)}) is smaller than recommended minimum ({min_samples_needed})")
     print(f"[WARNING] This may cause issues with distributed training across {NUM_GPUS} GPUs")
