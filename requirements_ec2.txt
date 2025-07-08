@@ -1,0 +1,58 @@
+# EC2 Optimized Requirements for GRPO Matrix Multiplication Inference
+# Tested for stability and performance on AWS EC2 instances
+
+# Core ML Libraries
+torch>=2.0.0,<2.5.0
+transformers>=4.35.0,<5.0.0
+peft>=0.7.0
+accelerate>=0.24.0
+
+# Tokenization and Text Processing
+tokenizers>=0.15.0
+sentencepiece>=0.1.99
+
+# Numerical Computing
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+
+# System and Performance
+psutil>=5.9.0
+tqdm>=4.65.0
+
+# Logging and Monitoring
+tensorboard>=2.15.0
+wandb>=0.16.0
+
+# Optional but recommended for EC2
+# GPU support (install only if GPU available)
+# torch-audio  # Uncomment if needed
+# torchvision  # Uncomment if needed
+
+# Development and Debugging
+ipython>=8.10.0
+
+# Data Handling
+datasets>=2.14.0
+
+# Model Optimization
+optimum>=1.15.0
+
+# AWS Integration (optional)
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Safety and Security
+packaging>=23.0
+requests>=2.31.0
+
+# Performance Monitoring
+gpustat>=1.1.1  # For GPU monitoring
+nvidia-ml-py3>=7.352.0  # NVIDIA GPU support
+
+# Memory Management
+py3nvml>=0.2.7  # NVIDIA GPU memory monitoring
+
+# Additional utilities
+fire>=0.5.0  # For command-line interfaces
+rich>=13.0.0  # For beautiful terminal output
+gdown>=4.6.0  # For downloading models from Google Drive 
