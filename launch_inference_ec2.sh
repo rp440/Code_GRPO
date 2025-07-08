@@ -45,6 +45,14 @@ python3 download_final_adapter.py
 # Check Python environment
 echo "🐍 Python Environment:"
 python3 --version
+
+# Install uv if not present
+if ! command -v uv &> /dev/null; then
+    echo "📦 Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source $HOME/.cargo/env
+fi
+
 uv --version
 
 # Check if virtual environment exists
