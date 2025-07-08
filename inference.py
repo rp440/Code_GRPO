@@ -92,7 +92,7 @@ def run_inference_test(inference_model, inference_tokenizer, test_matrices=None)
     # Generate response
     outputs = text_gen_pipeline(
         formatted_prompt, 
-        max_new_tokens=350, 
+        max_new_tokens=750, 
         do_sample=False, 
         temperature=0.1, 
         top_p=0.9,
