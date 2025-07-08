@@ -67,7 +67,7 @@ uv --version
 
 # Install/upgrade requirements
 echo "📦 Installing requirements..."
-sudo uv pip install --system -r requirements_ec2.txt
+sudo $HOME/.local/bin/uv pip install --system -r requirements_ec2.txt
 
 # Set environment variables for optimal performance
 export TOKENIZERS_PARALLELISM=false
