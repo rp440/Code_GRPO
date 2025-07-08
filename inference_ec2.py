@@ -15,6 +15,7 @@ import json
 import logging
 import time
 from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, TextIteratorStreamer
 from peft import PeftModel
 
@@ -28,6 +29,36 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ==============================================
+#  INFERENCE CONFIGURATION
+# ==============================================
+@dataclass
+class InferenceConfig:
+    """Inference configuration parameters for GRPO model."""
+    # --- sequence lengths ---
+    max_completion_length: int = 750
+    max_prompt_length: int = 256
+
+    # --- generation / exploration ---
+    temperature: float = 1.4                 # higher entropy for exploration
+    top_k: int | None = None                 # allow disabling top-k sampling
+    top_p: float = 0.95                      # nucleus sampling threshold
+
+    # --- generation parameters ---
+    do_sample: bool = True                   # enable sampling
+    num_beams: int = 1                       # beam search disabled for exploration
+    early_stopping: bool = False             # disable early stopping
+    
+    # --- batch processing ---
+    batch_size: int = 1                      # inference batch size
+    
+    # --- verbose logging helpers ---
+    log_completions: bool = True
+    num_completions_to_print: int = 2
+
+# Global inference configuration
+INFERENCE_CFG = InferenceConfig()
 
 # EC2 Configuration Constants
 BASE_MODEL_NAME_FOR_FINETUNING = "Qwen/Qwen2-1.5B"
@@ -319,14 +350,18 @@ class EC2ChatInterface:
         generation_kwargs = {
             'input_ids': inputs['input_ids'],
             'attention_mask': inputs['attention_mask'],
-            'max_new_tokens': 512,
+            'max_new_tokens': INFERENCE_CFG.max_completion_length,
             'streamer': streamer,
-            'do_sample': True,
-            'temperature': 0.7,
-            'top_p': 0.9,
+            'do_sample': INFERENCE_CFG.do_sample,
+            'temperature': INFERENCE_CFG.temperature,
+            'top_p': INFERENCE_CFG.top_p,
             'pad_token_id': tokenizer.pad_token_id,
             'eos_token_id': tokenizer.eos_token_id
         }
+        
+        # Add top_k if specified
+        if INFERENCE_CFG.top_k is not None:
+            generation_kwargs['top_k'] = INFERENCE_CFG.top_k
         
         # Start generation in separate thread
         thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
@@ -505,9 +540,17 @@ def main():
     """Main function for EC2 inference"""
     logger.info("Starting EC2 GRPO Matrix Multiplication Inference")
     
+    # Log inference configuration
+    logger.info("Inference Configuration:")
+    logger.info(f"  Max completion length: {INFERENCE_CFG.max_completion_length}")
+    logger.info(f"  Temperature: {INFERENCE_CFG.temperature}")
+    logger.info(f"  Top-p: {INFERENCE_CFG.top_p}")
+    logger.info(f"  Top-k: {INFERENCE_CFG.top_k}")
+    logger.info(f"  Do sample: {INFERENCE_CFG.do_sample}")
+    
     # Configuration
     MODELS = [
-        'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+        'Qwen/Qwen2-1.5B',
         # 'Qwen/Qwen2-1.5B-Instruct'  # Uncomment if needed
     ]
     
