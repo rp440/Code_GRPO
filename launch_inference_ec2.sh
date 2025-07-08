@@ -45,7 +45,7 @@ python3 download_final_adapter.py
 # Check Python environment
 echo "🐍 Python Environment:"
 python3 --version
-pip3 --version
+uv --version
 
 # Check if virtual environment exists
 # if [ ! -d "venv" ]; then
@@ -59,8 +59,7 @@ pip3 --version
 
 # Install/upgrade requirements
 echo "📦 Installing requirements..."
-pip install --upgrade pip
-pip install -r requirements_ec2.txt
+uv pip install -r requirements_ec2.txt
 
 # Set environment variables for optimal performance
 export TOKENIZERS_PARALLELISM=false
