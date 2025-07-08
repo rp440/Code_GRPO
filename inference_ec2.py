@@ -41,7 +41,7 @@ class InferenceConfig:
     max_prompt_length: int = 256
 
     # --- generation / exploration ---
-    temperature: float = 1.4                 # higher entropy for exploration
+    temperature: float = 1                 # higher entropy for exploration
     top_k: int | None = None                 # allow disabling top-k sampling
     top_p: float = 0.95                      # nucleus sampling threshold
 
@@ -550,7 +550,7 @@ def main():
     
     # Configuration
     MODELS = [
-        'Qwen/Qwen2-1.5B',
+        'Qwen/Qwen2-7B',
         # 'Qwen/Qwen2-1.5B-Instruct'  # Uncomment if needed
     ]
     
